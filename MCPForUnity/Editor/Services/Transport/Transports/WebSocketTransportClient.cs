@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Route;
 using MCPForUnity.Editor.Services.Transport;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -701,6 +702,21 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["unity_version"] = _unityVersion,
                 ["project_path"] = _projectPath
             };
+
+            // Echo this editor process's launch nonce so a guarded dedicated server can prove
+            // the registering Unity instance is the instance its route was launched for.
+            if (McpRouteProvider.TryGetActiveLaunchToken(out string instanceToken))
+            {
+                registerPayload["instance_token"] = instanceToken;
+            }
+
+            // Send the canonical project root so the server can validate ownership against the
+            // same identity it was launched with (Windows path separators and case normalized).
+            string canonicalRoot = McpRouteProvider.GetCanonicalProjectRoot();
+            if (!string.IsNullOrEmpty(canonicalRoot))
+            {
+                registerPayload["canonical_project_root"] = canonicalRoot;
+            }
 
             await SendJsonAsync(registerPayload, token).ConfigureAwait(false);
         }

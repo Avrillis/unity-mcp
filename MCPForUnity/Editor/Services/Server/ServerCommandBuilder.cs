@@ -4,6 +4,7 @@ using System.Linq;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Route;
 using UnityEditor;
 using UnityEngine;
 
@@ -39,6 +40,21 @@ namespace MCPForUnity.Editor.Services.Server
                 return false;
             }
 
+            // A managed (supervisor-launched) route only means something if the server is the
+            // approved implementation: the project-root/nonce guard lives in it. A global
+            // `--from` server-source override would swap the implementation out from under the
+            // guard, so a managed route refuses it instead of degrading silently.
+            string sourceOverride = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, string.Empty);
+            if (!McpRouteConfiguration.IsServerSourceOverrideAllowed(
+                    McpRouteProvider.Configuration.IsManagedRoute, sourceOverride))
+            {
+                error =
+                    "This editor's MCP endpoint was supplied by its launching process, so it must "
+                    + "use the approved MCP server build. Clear the \"Server source override\" "
+                    + $"advanced setting (currently '{sourceOverride}') to start the managed server.";
+                return false;
+            }
+
             var (uvxPath, fromUrl, packageName) = AssetPathUtility.GetUvxCommandParts();
             if (string.IsNullOrEmpty(uvxPath))
             {
@@ -47,6 +63,19 @@ namespace MCPForUnity.Editor.Services.Server
             }
 
             string devFlags = AssetPathUtility.GetUvxDevFlags();
+
+            // The server binds its registration/dispatch guard to the editor's canonical
+            // project root. Without it a managed dedicated route has no project identity, so
+            // refuse to build a launch command rather than degrade to an unguarded server.
+            string projectRoot = McpRouteStateStore.ResolveProjectRoot();
+            if (string.IsNullOrWhiteSpace(projectRoot))
+            {
+                error = "The Unity project root could not be resolved; refusing to launch an unguarded local HTTP server.";
+                return false;
+            }
+
+            string projectRootFlag = $" --unity-project-root {QuoteIfNeeded(projectRoot)}";
+
             bool projectScopedTools = EditorPrefs.GetBool(
                 EditorPrefKeys.ProjectScopedToolsLocalHttp,
                 true
@@ -57,8 +86,8 @@ namespace MCPForUnity.Editor.Services.Server
             string fromArgs = AssetPathUtility.GetBetaServerFromArgs(quoteFromPath: true);
 
             string args = string.IsNullOrEmpty(fromArgs)
-                ? $"{devFlags}{packageName} --transport http --http-url {httpUrl}{scopedFlag}"
-                : $"{devFlags}{fromArgs} {packageName} --transport http --http-url {httpUrl}{scopedFlag}";
+                ? $"{devFlags}{packageName} --transport http --http-url {httpUrl}{projectRootFlag}{scopedFlag}"
+                : $"{devFlags}{fromArgs} {packageName} --transport http --http-url {httpUrl}{projectRootFlag}{scopedFlag}";
 
             fileName = uvxPath;
             arguments = args;

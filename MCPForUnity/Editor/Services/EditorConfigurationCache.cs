@@ -1,5 +1,6 @@
 using System;
 using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Services.Route;
 using UnityEditor;
 
 namespace MCPForUnity.Editor.Services
@@ -60,8 +61,26 @@ namespace MCPForUnity.Editor.Services
         /// <summary>
         /// Whether to use HTTP transport (true) or Stdio transport (false).
         /// Default: true
+        ///
+        /// A process-scoped UNITY_MCP_TRANSPORT override pins this for the lifetime of the
+        /// editor process, so a later domain reload or EditorPrefs edit cannot redirect the
+        /// route. An invalid process-scoped configuration fails closed (false).
         /// </summary>
-        public bool UseHttpTransport => _useHttpTransport;
+        public bool UseHttpTransport
+        {
+            get
+            {
+                McpRouteConfiguration route = McpRouteProvider.Configuration;
+                if (!route.IsValid)
+                {
+                    return false;
+                }
+
+                return route.HasTransportOverride
+                    ? route.Transport == McpTransportSelection.Http
+                    : _useHttpTransport;
+            }
+        }
 
         /// <summary>
         /// Whether debug logging is enabled.

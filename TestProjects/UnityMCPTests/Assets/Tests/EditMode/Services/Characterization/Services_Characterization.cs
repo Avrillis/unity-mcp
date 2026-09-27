@@ -66,11 +66,13 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         /// <summary>
-        /// Current behavior: IsLocalHttpServerRunning uses multi-strategy detection:
-        /// 1. Handshake validation (pidfile + token)
-        /// 2. Stored PID matching (EditorPrefs with 6-hour validity)
-        /// 3. Heuristic process matching
-        /// 4. Network probe fallback
+        /// Current behavior (managed-route isolation): IsLocalHttpServerRunning reports true
+        /// ONLY when the project-local ownership record (Library/MCPForUnity/RunState/
+        /// handshake.json) matches this editor lifetime, this endpoint, the live server PID,
+        /// its process start time, its launch nonce, its PID evidence file and the sole
+        /// listener on the endpoint port. The previous multi-strategy heuristics
+        /// (handshake-only, EditorPrefs stored PID, process-name matching, port probing)
+        /// were removed because they could observe a neighbour's server as our own.
         /// </summary>
         [Test]
         public void ServerManagementService_IsLocalHttpServerRunning_UsesMultiDetectionStrategy()
@@ -85,7 +87,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             }, "IsLocalHttpServerRunning should handle all detection strategies gracefully");
 
             // Result depends on actual server state - document the behavior
-            Assert.Pass($"IsLocalHttpServerRunning returned {result} using multi-strategy detection");
+            Assert.Pass($"IsLocalHttpServerRunning returned {result} using ownership-record validation");
         }
 
         /// <summary>
@@ -168,8 +170,11 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         /// <summary>
-        /// Current behavior: LooksLikeMcpServerProcess uses multi-layer validation
-        /// to identify MCP server processes.
+        /// Current behavior: IProcessDetector.LooksLikeMcpServerProcess still performs
+        /// platform-specific, multi-layer process identification, but ServerManagementService
+        /// no longer uses it on any termination path. Managed-route stop decisions require the
+        /// project-local ownership record instead; a process that merely "looks like" the MCP
+        /// server is never terminated.
         /// </summary>
         [Test]
         public void ServerManagementService_LooksLikeMcpServerProcess_UsesMultiStrategyValidation()
@@ -187,8 +192,10 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         /// <summary>
-        /// Current behavior: StopLocalHttpServer prefers pidfile-based approach
-        /// for deterministic termination.
+        /// Current behavior: StopLocalHttpServer terminates only the server this editor
+        /// lifetime provably owns, per the project-local ownership record. With no record (or
+        /// with missing/stale/ambiguous/foreign evidence) it refuses and leaves every process
+        /// untouched, so there is no pidfile/port/process-name fallback kill.
         /// </summary>
         [Test]
         [Explicit("Stops the MCP server - kills connection")]
@@ -203,7 +210,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 service.StopLocalHttpServer();
             }, "StopLocalHttpServer should handle no-server case gracefully");
 
-            Assert.Pass("StopLocalHttpServer uses pidfile-based approach with fallbacks");
+            Assert.Pass("StopLocalHttpServer requires exact project-local ownership evidence");
         }
 
         /// <summary>

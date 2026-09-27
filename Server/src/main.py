@@ -10,6 +10,7 @@ from core.telemetry import record_milestone, record_telemetry, MilestoneType, Re
 from services.resources import register_all_resources
 from transport.plugin_registry import PluginRegistry
 from transport.plugin_hub import PluginHub
+from transport.route_guard import build_guard, get_active_guard, set_active_guard
 from services.custom_tool_service import (
     CustomToolService,
     resolve_project_id_for_unity_instance,
@@ -424,6 +425,14 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                 if not command_type:
                     return JSONResponse({"success": False, "error": "Missing 'type' field"}, status_code=400)
 
+                # Dedicated route guard: this server serves exactly one Unity instance, so
+                # refuse any target that is not it (before looking anything up).
+                guard_decision = get_active_guard().authorize_target(unity_instance)
+                if not guard_decision.allowed:
+                    return JSONResponse(
+                        {"success": False, "error": guard_decision.reason}, status_code=403
+                    )
+
                 # Get available sessions
                 sessions = await PluginHub.get_sessions()
                 if not sessions.sessions:
@@ -557,6 +566,12 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                 instance_name, instance_hash = _normalize_instance_token(
                     unity_instance)
 
+                guard_decision = get_active_guard().authorize_target(unity_instance)
+                if not guard_decision.allowed:
+                    return JSONResponse(
+                        {"success": False, "error": guard_decision.reason}, status_code=403
+                    )
+
                 sessions = await PluginHub.get_sessions()
                 if not sessions.sessions:
                     return JSONResponse({
@@ -667,6 +682,11 @@ Environment Variables:
   UNITY_MCP_HTTP_URL   HTTP server URL (default: http://127.0.0.1:8080)
   UNITY_MCP_HTTP_HOST   HTTP server host (overrides URL host)
   UNITY_MCP_HTTP_PORT   HTTP server port (overrides URL port)
+
+Dedicated (managed) route isolation:
+  --unity-project-root  Bind this server instance to one Unity project. Rejects registrations
+                        for other projects and dispatch to other Unity instances.
+  --unity-instance-token  Per-launch ownership nonce that Unity must echo when registering.
 
 Examples:
   # Use specific Unity project as default
@@ -786,6 +806,17 @@ Examples:
              "Used by Unity to stop the exact process it launched when running in a terminal."
     )
     parser.add_argument(
+        "--unity-project-root",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Canonical Unity project root this dedicated server instance is bound to. "
+             "When set, the server rejects any Unity registration for a different project, "
+             "requires the launch nonce (--unity-instance-token) to be echoed back, and "
+             "refuses dispatch to any other Unity instance. Unset keeps the existing "
+             "multi-instance behaviour."
+    )
+    parser.add_argument(
         "--project-scoped-tools",
         action="store_true",
         help="Keep custom tools scoped to the active Unity project and enable the custom tools resource. "
@@ -872,6 +903,18 @@ Examples:
     # Optional lifecycle handshake for Unity-managed terminal launches
     if args.unity_instance_token:
         os.environ["UNITY_MCP_INSTANCE_TOKEN"] = args.unity_instance_token
+
+    # Dedicated-server route guard. With no --unity-project-root the guard stays disabled and
+    # every existing behaviour is preserved; with one the server binds to that single project.
+    guard = build_guard(args.unity_project_root, args.unity_instance_token)
+    set_active_guard(guard)
+    if guard.enabled:
+        logger.info("Dedicated route guard: %s", guard.describe())
+        if not guard.usable:
+            logger.error(
+                "Refusing all Unity registrations and dispatch: %s", guard.invalid_reason
+            )
+
     if args.pidfile:
         try:
             pid_dir = os.path.dirname(args.pidfile)

@@ -76,3 +76,7 @@ docs/superpowers/
 
 # Reference DLLs fetched by tools/compile-check.sh (not redistributable)
 .compile-refs/
+
+# Build output for the hermetic C# route-isolation test harness
+tools/route-isolation-tests/bin/
+tools/route-isolation-tests/obj/

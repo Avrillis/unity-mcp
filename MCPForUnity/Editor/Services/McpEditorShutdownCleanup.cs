@@ -10,8 +10,14 @@ namespace MCPForUnity.Editor.Services
     /// <summary>
     /// Best-effort cleanup when the Unity Editor is quitting.
     /// - Stops active transports so clients don't see a "hung" session longer than necessary.
-    /// - Stops the local HTTP server this Unity instance launched (handshake/pidfile-based), so a
-    ///   headless server doesn't become an invisible orphan. This runs on quit only, never on domain reload.
+    /// - Stops the local HTTP server this Unity instance launched, so a headless server doesn't
+    ///   become an invisible orphan. This runs on quit only, never on domain reload.
+    ///
+    /// Termination requires exact project-local ownership evidence (see
+    /// ServerManagementService): this editor lifetime, this endpoint, the live server PID and
+    /// creation time, the launch nonce and the PID evidence file must all agree. Missing,
+    /// stale, ambiguous or foreign evidence means the process is left untouched, so one
+    /// editor can never stop another editor's or another project's server.
     /// </summary>
     [InitializeOnLoad]
     internal static class McpEditorShutdownCleanup
@@ -54,8 +60,9 @@ namespace MCPForUnity.Editor.Services
 
             // 2) Stop the local HTTP server this Unity instance launched (best-effort).
             // Headless servers have no terminal window, so an unstopped one is an invisible orphan.
-            // StopManagedLocalHttpServer only stops the server matching our pidfile+instance-token handshake,
-            // so it never touches servers launched by other Unity instances. This runs on quit only;
+            // StopManagedLocalHttpServer only stops the server whose project-local ownership record
+            // matches this editor lifetime exactly, so it never touches servers launched by other
+            // Unity instances. This runs on quit only;
             // domain reloads must NOT stop the server (and don't — this handler is gated on EditorApplication.quitting).
             try
             {

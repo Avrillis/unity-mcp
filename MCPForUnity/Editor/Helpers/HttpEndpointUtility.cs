@@ -3,6 +3,7 @@ using System.Net;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Models;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Route;
 using UnityEditor;
 
 namespace MCPForUnity.Editor.Helpers
@@ -14,6 +15,9 @@ namespace MCPForUnity.Editor.Helpers
     ///
     /// HTTP Local and HTTP Remote use separate EditorPrefs keys so that switching
     /// between scopes does not overwrite the other scope's URL.
+    ///
+    /// A process-scoped route (UNITY_MCP_HTTP_URL) takes precedence over the stored
+    /// local URL and pins the local scope for the lifetime of the editor process.
     /// </summary>
     public static class HttpEndpointUtility
     {
@@ -25,17 +29,34 @@ namespace MCPForUnity.Editor.Helpers
         /// <summary>
         /// Returns the normalized base URL for the currently active HTTP scope.
         /// If the scope is "remote", returns the remote URL; otherwise returns the local URL.
+        ///
+        /// A process-scoped HTTP URL forces the local scope: a supervisor-managed route is
+        /// always local, no matter what the stored scope says.
         /// </summary>
         public static string GetBaseUrl()
         {
+            if (McpRouteProvider.Configuration.ForcesLocalScope)
+            {
+                return GetLocalBaseUrl();
+            }
+
             return IsRemoteScope() ? GetRemoteBaseUrl() : GetLocalBaseUrl();
         }
 
         /// <summary>
         /// Saves a user-provided URL to the currently active HTTP scope's pref.
+        /// Ignored for a process-scoped route, which the editor process does not own.
         /// </summary>
         public static void SaveBaseUrl(string userValue)
         {
+            if (McpRouteProvider.Configuration.HasHttpUrlOverride)
+            {
+                McpLog.Warn(
+                    "[MCP Route] Ignoring an HTTP URL change: this editor's endpoint was supplied "
+                    + "by its launching process and is fixed for this process lifetime.");
+                return;
+            }
+
             if (IsRemoteScope())
             {
                 SaveRemoteBaseUrl(userValue);
@@ -51,6 +72,28 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static string GetLocalBaseUrl()
         {
+            McpRouteConfiguration configuration = McpRouteProvider.Configuration;
+            if (!configuration.IsValid)
+            {
+                // Fail closed: nothing may launch, connect or stop against a rejected route.
+                return string.Empty;
+            }
+
+            if (configuration.HasHttpUrlOverride)
+            {
+                return configuration.LocalHttpBaseUrl;
+            }
+
+            return GetStoredLocalBaseUrl();
+        }
+
+        /// <summary>
+        /// Returns the normalized local HTTP base URL from EditorPrefs only, ignoring any
+        /// process-scoped override. Used by <see cref="McpRouteProvider"/> while resolving,
+        /// so it must not consult the resolved route.
+        /// </summary>
+        public static string GetStoredLocalBaseUrl()
+        {
             string stored = EditorPrefs.GetString(LocalPrefKey, DefaultLocalBaseUrl);
             return NormalizeBaseUrl(stored, DefaultLocalBaseUrl, remoteScope: false);
         }
@@ -60,6 +103,14 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static void SaveLocalBaseUrl(string userValue)
         {
+            if (McpRouteProvider.Configuration.HasHttpUrlOverride)
+            {
+                McpLog.Warn(
+                    "[MCP Route] Ignoring an HTTP Local URL change: this editor's endpoint was supplied "
+                    + "by its launching process and is fixed for this process lifetime.");
+                return;
+            }
+
             string normalized = NormalizeBaseUrl(userValue, DefaultLocalBaseUrl, remoteScope: false);
             EditorPrefs.SetString(LocalPrefKey, normalized);
         }
@@ -131,6 +182,11 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static bool IsRemoteScope()
         {
+            if (McpRouteProvider.Configuration.ForcesLocalScope)
+            {
+                return false;
+            }
+
             string scope = EditorConfigurationCache.Instance.HttpTransportScope;
             return string.Equals(scope, "remote", StringComparison.OrdinalIgnoreCase);
         }

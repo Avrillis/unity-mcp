@@ -37,6 +37,11 @@ class RegisterMessage(BaseModel):
     project_hash: str
     unity_version: str = "Unknown"
     project_path: str | None = None  # Full path to project root (for focus nudging)
+    # Canonical project root as computed by the package. Used by a guarded dedicated
+    # server to bind itself to one project (see transport/route_guard.py).
+    canonical_project_root: str | None = None
+    # Per-launch ownership nonce echoed back from the server's --unity-instance-token.
+    instance_token: str | None = None
 
 
 class RegisterToolsMessage(BaseModel):

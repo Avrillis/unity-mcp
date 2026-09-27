@@ -17,6 +17,7 @@ from core.config import config
 from core.constants import API_KEY_HEADER
 from models.models import MCPResponse
 from transport.plugin_registry import PluginRegistry
+from transport.route_guard import get_active_guard
 from services.api_key_service import ApiKeyService
 
 if TYPE_CHECKING:
@@ -111,6 +112,14 @@ class InstanceSelectionRequiredError(RuntimeError):
         if self.available_instances:
             text = f"{text} Available instances: {self.available_instances}."
         super().__init__(text)
+
+
+class CrossTargetDispatchError(RuntimeError):
+    """Raised when a guarded dedicated server is asked to reach a foreign Unity instance.
+
+    A dedicated server serves exactly one Unity project. Refusing the target before dispatch
+    is what stops one worker's agent from reaching a sibling route.
+    """
 
 
 class PluginHub(WebSocketEndpoint):
@@ -276,8 +285,23 @@ class PluginHub(WebSocketEndpoint):
                         )
                 if cls._registry:
                     await cls._registry.unregister(session_id)
+                    await cls._release_guard_binding_if_orphaned()
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
+
+    @classmethod
+    async def _release_guard_binding_if_orphaned(cls) -> None:
+        """Drop the guarded binding once its Unity instance is gone.
+
+        The guard is re-armed by the plugin's next ``register`` message, so releasing here
+        only prevents a stale binding from authorizing a later dispatch.
+        """
+        guard = get_active_guard()
+        if not guard.enabled or not guard.bound_project_hash or cls._registry is None:
+            return
+
+        if not await cls._registry.get_session_id_by_hash(guard.bound_project_hash):
+            guard.release_binding()
 
     # ------------------------------------------------------------------
     # Public API
@@ -443,6 +467,25 @@ class PluginHub(WebSocketEndpoint):
             await websocket.close(code=4400)
             raise ValueError(
                 "Plugin registration missing project_hash")
+
+        # Dedicated-server route guard: bind this server to exactly one Unity project and
+        # reject any foreign registration (wrong project or wrong/missing launch nonce).
+        guard = get_active_guard()
+        if guard.enabled:
+            decision = guard.authorize_registration(
+                project_name=project_name,
+                project_hash=project_hash,
+                project_path=project_path,
+                canonical_root=payload.canonical_project_root,
+                instance_token=payload.instance_token,
+            )
+            if not decision.allowed:
+                logger.warning(
+                    "Rejected Unity registration for project %s (hash=%s): %s",
+                    project_name, project_hash, decision.reason,
+                )
+                await websocket.close(code=4403)
+                return
 
         # Get user_id from websocket state (set during API key validation)
         user_id = getattr(websocket.state, "user_id", None)
@@ -869,6 +912,14 @@ class PluginHub(WebSocketEndpoint):
         if cls._registry is None:
             raise RuntimeError("Plugin registry not configured")
 
+        # Guarded dedicated mode: refuse a foreign target before any resolution/dispatch so a
+        # sibling route can never be addressed through this server.
+        guard = get_active_guard()
+        if guard.enabled:
+            decision = guard.authorize_target(unity_instance)
+            if not decision.allowed:
+                raise CrossTargetDispatchError(decision.reason)
+
         # Bound waiting for Unity sessions. Default to 20s to handle domain reloads
         # (which can take 10-20s after test runs or script changes).
         #
@@ -1011,6 +1062,18 @@ class PluginHub(WebSocketEndpoint):
                 user_id=user_id,
                 retry_on_reload=retry_on_reload,
             )
+        except CrossTargetDispatchError as exc:
+            logger.warning(
+                "Refused cross-target dispatch (command=%s instance=%s): %s",
+                command_type, unity_instance or "default", exc,
+            )
+            return MCPResponse(
+                success=False,
+                error=(
+                    "This dedicated MCP server is bound to one Unity instance; "
+                    f"requested target '{unity_instance}' is refused. {exc}"
+                ),
+            ).model_dump()
         except NoUnitySessionError:
             logger.debug(
                 "Unity session unavailable; returning retry: command=%s instance=%s",

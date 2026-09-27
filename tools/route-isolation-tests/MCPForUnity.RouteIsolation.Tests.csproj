@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Tracks the installed .NET SDK; the sources under test are C# 9 / BCL-only. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>MCPForUnity.RouteIsolation.Tests</AssemblyName>
+    <RootNamespace>MCPForUnity.RouteIsolation.Tests</RootNamespace>
+    <NoWarn>CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    Only the dependency-free "pure" sources are compiled here. They deliberately contain no
+    UnityEngine/UnityEditor references, which is what lets this suite run without an Editor.
+    The Unity-facing adapters around them are covered by tools/compile-check-dotnet.ps1.
+  -->
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRouteConfiguration.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRouteConfigurationCache.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRunStateRecord.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpOwnershipEvaluator.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="NUnit" Version="4.2.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+</Project>

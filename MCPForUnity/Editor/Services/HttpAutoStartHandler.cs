@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Route;
 using MCPForUnity.Editor.Services.Transport;
 using MCPForUnity.Editor.Windows;
 using UnityEditor;
@@ -50,10 +51,22 @@ namespace MCPForUnity.Editor.Services
             bool connectPending = SessionState.GetBool(ConnectPendingKey, false);
 
             // Cheap pre-check so the common case (auto-start off, nothing pending) costs one
-            // EditorPrefs read per domain load instead of an update subscription. The pref is
-            // re-read every domain load, so enabling it takes effect at the next reload.
+            // resolved-configuration read per domain load instead of an update subscription.
+            //
+            // The resolved configuration is frozen for this editor process, so a process-scoped
+            // UNITY_MCP_AUTOSTART cannot be flipped by a later UI/EditorPrefs change. With no
+            // process override the pref is still re-read every domain load, as before.
+            McpRouteConfiguration route = McpRouteProvider.Configuration;
+            if (!route.IsValid)
+            {
+                McpLog.Warn(
+                    "[HTTP Auto-Start] Disabled: the process-scoped MCP configuration was rejected "
+                    + $"({route.ValidationError})");
+                return;
+            }
+
             if (!latched && !connectPending &&
-                !EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false))
+                !route.AutoStart)
             {
                 return;
             }
@@ -137,7 +150,7 @@ namespace MCPForUnity.Editor.Services
                 // Only check lightweight EditorPrefs here — heavier services are touched in
                 // TryBeginAutoStart once the editor is idle. No latch when disabled: the pref
                 // is re-read on the next domain load.
-                if (!EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false)) return TickDecision.Skip;
+                if (!McpRouteProvider.Configuration.AutoStart) return TickDecision.Skip;
             }
 
             // A pending reload-resume owns bridge revival — checked only when we would
@@ -181,7 +194,8 @@ namespace MCPForUnity.Editor.Services
             bool proceed;
             try
             {
-                proceed = EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false)
+                proceed = McpRouteProvider.Configuration.IsValid
+                    && McpRouteProvider.Configuration.AutoStart
                     && EditorConfigurationCache.Instance.UseHttpTransport
                     && !MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http);
             }
@@ -295,7 +309,7 @@ namespace MCPForUnity.Editor.Services
             while (true)
             {
                 // Abort if user changed settings while we were waiting.
-                if (!EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false)) return;
+                if (!McpRouteProvider.Configuration.AutoStart) return;
                 if (!EditorConfigurationCache.Instance.UseHttpTransport) return;
                 if (MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http)) return;
 
