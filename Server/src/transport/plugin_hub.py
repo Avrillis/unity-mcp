@@ -1066,6 +1066,16 @@ class PluginHub(WebSocketEndpoint):
             )
 
         session = await cls._registry.get_session(session_id)
+        if session is None:
+            # The registry still maps the bound hash to a session id, but that exact session is
+            # not currently present. The binding is stale; never hand the stale id back, because
+            # a caller must not be able to dispatch to a session the registry no longer holds.
+            return DispatchSelection(
+                guarded=True,
+                error="The dedicated Unity instance is not connected.",
+                status_code=503,
+            )
+
         return DispatchSelection(
             guarded=True,
             session_id=session_id,

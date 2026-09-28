@@ -207,17 +207,28 @@ namespace MCPForUnity.RouteIsolation.Tests
             }
         }
 
-        private static Func<IReadOnlyList<int>> Listeners(params int[] pids)
-            => () => pids;
+        /// <summary>
+        /// Re-observation delegate for the final termination check. The production stop path
+        /// re-gathers the whole live ownership tuple inside the critical section; these helpers
+        /// supply that tuple directly so a single field can be perturbed per test.
+        /// </summary>
+        private static Func<McpOwnershipObservation> Observe(
+            OwnershipFixture fixture,
+            params int[] listenerPids)
+        {
+            McpOwnershipObservation observation = fixture.BuildObservation();
+            observation.ListeningProcessIds = listenerPids;
+            return () => observation;
+        }
 
         private McpTerminationOutcome Terminate(
             McpRunStateRecord evaluated,
             FakeHandle handle,
-            Func<IReadOnlyList<int>> probe,
+            Func<McpOwnershipObservation> reobserve,
             IMcpOwnershipLockProvider locks = null)
             => McpOwnershipMutation.TerminateIfStillOwned(
                 locks ?? NewStore(),
-                probe,
+                reobserve,
                 evaluated,
                 OwnershipFixture.DefaultServerStart,
                 handle);
@@ -231,7 +242,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             var handle = new FakeHandle();
 
             McpTerminationOutcome outcome = Terminate(
-                record, handle, Listeners(record.ServerPid));
+                record, handle, Observe(fixture, record.ServerPid));
 
             Assert.That(outcome.Terminated, Is.True, outcome.Reason);
             Assert.That(outcome.RecordRemoved, Is.True, outcome.Reason);
@@ -253,7 +264,8 @@ namespace MCPForUnity.RouteIsolation.Tests
             Publish(successor);
 
             var handle = new FakeHandle();
-            McpTerminationOutcome outcome = Terminate(evaluated, handle, Listeners(evaluated.ServerPid));
+            McpTerminationOutcome outcome = Terminate(
+                evaluated, handle, Observe(fixture, evaluated.ServerPid));
 
             Assert.That(outcome.Terminated, Is.False);
             Assert.That(handle.KillCalls, Is.EqualTo(0), "a replaced record must never authorise a kill");
@@ -287,7 +299,8 @@ namespace MCPForUnity.RouteIsolation.Tests
             Publish(changed);
 
             var handle = new FakeHandle();
-            McpTerminationOutcome outcome = Terminate(evaluated, handle, Listeners(evaluated.ServerPid));
+            McpTerminationOutcome outcome = Terminate(
+                evaluated, handle, Observe(fixture, evaluated.ServerPid));
 
             Assert.That(outcome.Terminated, Is.False);
             Assert.That(handle.KillCalls, Is.EqualTo(0));
@@ -301,10 +314,11 @@ namespace MCPForUnity.RouteIsolation.Tests
             Publish(record);
 
             var handle = new FakeHandle();
-            McpTerminationOutcome outcome = Terminate(record, handle, Listeners(record.ServerPid + 7));
+            McpTerminationOutcome outcome = Terminate(
+                record, handle, Observe(fixture, record.ServerPid + 7));
 
             Assert.That(outcome.Terminated, Is.False);
-            Assert.That(outcome.Reason, Does.Contain("listener"));
+            Assert.That(outcome.Reason, Does.Contain("Listener"));
             Assert.That(handle.KillCalls, Is.EqualTo(0));
             Assert.That(File.Exists(_handshakePath), Is.True, "the record is left for the owner");
         }
@@ -317,7 +331,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             Publish(record);
 
             var handle = new FakeHandle();
-            McpTerminationOutcome outcome = Terminate(record, handle, Listeners());
+            McpTerminationOutcome outcome = Terminate(record, handle, Observe(fixture));
 
             Assert.That(outcome.Terminated, Is.False);
             Assert.That(handle.KillCalls, Is.EqualTo(0));
@@ -331,7 +345,8 @@ namespace MCPForUnity.RouteIsolation.Tests
             Publish(record);
 
             var handle = new FakeHandle { Start = OwnershipFixture.DefaultServerStart.AddSeconds(30) };
-            McpTerminationOutcome outcome = Terminate(record, handle, Listeners(record.ServerPid));
+            McpTerminationOutcome outcome = Terminate(
+                record, handle, Observe(fixture, record.ServerPid));
 
             Assert.That(outcome.Terminated, Is.False);
             Assert.That(handle.KillCalls, Is.EqualTo(0));
@@ -345,7 +360,8 @@ namespace MCPForUnity.RouteIsolation.Tests
             File.WriteAllText(_handshakePath, "{ not json");
 
             var handle = new FakeHandle();
-            McpTerminationOutcome outcome = Terminate(record, handle, Listeners(record.ServerPid));
+            McpTerminationOutcome outcome = Terminate(
+                record, handle, Observe(fixture, record.ServerPid));
 
             Assert.That(outcome.Terminated, Is.False);
             Assert.That(handle.KillCalls, Is.EqualTo(0));
@@ -362,7 +378,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             var handle = new FakeHandle();
             McpTerminationOutcome outcome = McpOwnershipMutation.TerminateIfStillOwned(
                 new AlwaysBusyLocks(),
-                Listeners(record.ServerPid),
+                Observe(fixture, record.ServerPid),
                 record,
                 OwnershipFixture.DefaultServerStart,
                 handle);

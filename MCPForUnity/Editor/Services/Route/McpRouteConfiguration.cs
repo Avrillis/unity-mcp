@@ -303,7 +303,9 @@ namespace MCPForUnity.Editor.Services.Route
         ///   * the URL text must carry an explicit TCP port - <see cref="Uri.Port"/> reports the
         ///     scheme default (80 for http) when no port was written, so a portless URL would
         ///     otherwise masquerade as a concrete endpoint;
-        ///   * only loopback hosts are permitted; the legacy LAN/bind-all opt-in does not apply.
+        ///   * the host must be exactly one of <c>localhost</c>, <c>127.0.0.1</c> or <c>::1</c>.
+        ///     The legacy LAN/bind-all opt-in does not apply, and the wider 127/8 loopback range is
+        ///     refused because two workers on one machine could otherwise name each other's port.
         /// </summary>
         public static bool TryValidateManagedHttpUrl(
             string value,
@@ -320,7 +322,19 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
-            // Loopback-only, and never the LAN opt-in: managed routes are local to one editor.
+            // The managed allowlist is deliberately narrower than the legacy loopback check: the
+            // whole 127/8 range is NOT a managed endpoint. Only the three approved spellings (and
+            // host forms that canonicalize to them, e.g. 127.1 -> 127.0.0.1) are accepted, so a
+            // sibling worker's chosen loopback address can never be described as this route.
+            if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out Uri managedUri)
+                || !IsManagedLoopbackHost(managedUri.Host))
+            {
+                error = "managed routes must target exactly localhost, 127.0.0.1 or [::1]; "
+                        + "other loopback addresses are not an approved managed endpoint.";
+                return false;
+            }
+
+            // Never the LAN opt-in: managed routes are local to one editor.
             if (!TryValidateLocalHttpUrl(value, allowLanBind: false, out normalized, out error))
             {
                 return false;
@@ -334,6 +348,39 @@ namespace MCPForUnity.Editor.Services.Route
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// True only for the exact hosts a MANAGED (process-scoped) route may name:
+        /// <c>localhost</c>, <c>127.0.0.1</c> and <c>::1</c>.
+        ///
+        /// This is intentionally stricter than <see cref="IsLoopbackHost"/>: the legacy helper
+        /// accepts the whole IPv4 loopback range (127/8), which would let a managed route silently
+        /// describe an endpoint belonging to a sibling worker on the same machine. Host forms that
+        /// canonicalize to an approved address (for example <c>127.1</c> or the expanded IPv6
+        /// spelling of <c>::1</c>) are accepted, because they name the identical address.
+        /// </summary>
+        public static bool IsManagedLoopbackHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                return false;
+            }
+
+            string normalized = host.Trim();
+            if (normalized.Length >= 2 && normalized[0] == '[' && normalized[normalized.Length - 1] == ']')
+            {
+                normalized = normalized.Substring(1, normalized.Length - 2);
+            }
+
+            if (string.Equals(normalized, "localhost", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return System.Net.IPAddress.TryParse(normalized, out System.Net.IPAddress parsed)
+                   && (parsed.Equals(System.Net.IPAddress.Loopback)
+                       || parsed.Equals(System.Net.IPAddress.IPv6Loopback));
         }
 
         /// <summary>

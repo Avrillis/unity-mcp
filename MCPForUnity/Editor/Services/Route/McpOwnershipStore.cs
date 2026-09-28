@@ -227,20 +227,26 @@ namespace MCPForUnity.Editor.Services.Route
 
         /// <summary>
         /// Final termination guard. Everything below happens inside the cross-process critical
-        /// section, from a fresh read:
+        /// section, from fresh observations taken at that moment - the initial evaluation is never
+        /// trusted for any mutable evidence:
         ///
         ///   1. the ownership file must still hold exactly the evaluated publication;
-        ///   2. the endpoint must still be owned by exactly the validated server PID;
+        ///   2. the live ownership tuple is re-observed and re-evaluated: project root, endpoint,
+        ///      lifecycle, editor and server identities, listener ownership, the PID file (path,
+        ///      presence, readability and the PID it names) and the launch nonce the server's
+        ///      command line still carries;
         ///   3. the retained process handle must still be the validated lifetime;
         ///   4. only then is the process terminated through that retained handle;
         ///   5. the ownership file is deleted only while it is still that same publication.
         ///
-        /// Any change - a replaced record, a changed or vanished listener, a different retained
-        /// lifetime - refuses the kill and leaves the process untouched.
+        /// Any change - a replaced record, a changed/vanished listener, a PID file that moved,
+        /// vanished, became unreadable or now names another PID, a nonce that left the command
+        /// line, or a different retained lifetime - refuses the kill and leaves the process
+        /// untouched.
         /// </summary>
         public static McpTerminationOutcome TerminateIfStillOwned(
             IMcpOwnershipLockProvider locks,
-            Func<System.Collections.Generic.IReadOnlyList<int>> listenerProbe,
+            Func<McpOwnershipObservation> reobserveLiveEvidence,
             McpRunStateRecord evaluated,
             DateTime validatedServerStartUtc,
             IRetainedProcessHandle handle,
@@ -263,6 +269,12 @@ namespace MCPForUnity.Editor.Services.Route
                     "the cross-process ownership lock could not be obtained; refusing to terminate.");
             }
 
+            if (reobserveLiveEvidence == null)
+            {
+                return McpTerminationOutcome.Refused(
+                    "no live ownership evidence could be re-observed; refusing to terminate.");
+            }
+
             if (!locks.TryBegin(out IMcpOwnershipTransaction transaction, out string lockError))
             {
                 return McpTerminationOutcome.Refused(lockError);
@@ -283,12 +295,16 @@ namespace MCPForUnity.Editor.Services.Route
                         "a different ownership record is now published; refusing to terminate.");
                 }
 
-                System.Collections.Generic.IReadOnlyList<int> listeners =
-                    listenerProbe?.Invoke() ?? Array.Empty<int>();
-                if (listeners.Count != 1 || listeners[0] != evaluated.ServerPid)
+                // Refresh every piece of live evidence inside the critical section, immediately
+                // before the retained handle is used. Cached PID-file and command-line/nonce
+                // observations from the initial evaluation are deliberately discarded here.
+                McpOwnershipObservation fresh = reobserveLiveEvidence();
+                McpOwnershipDecision revalidated = McpOwnershipEvaluator.EvaluateStop(evaluated, fresh);
+                if (!revalidated.Allowed)
                 {
                     return McpTerminationOutcome.Refused(
-                        "the endpoint's listener changed before termination; refusing to terminate.");
+                        $"the live ownership evidence changed before termination ({revalidated.Reason}): "
+                        + $"{revalidated.Detail} The process was left untouched.");
                 }
 
                 if (!handle.TryGetStartTimeUtc(out DateTime retainedStart)
@@ -434,15 +450,24 @@ namespace MCPForUnity.Editor.Services.Route
             string json;
             try
             {
-                if (!File.Exists(_handshakePath))
-                {
-                    return McpOwnershipSnapshot.Absent("no ownership record is present.");
-                }
-
                 json = File.ReadAllText(_handshakePath, Encoding.UTF8);
+            }
+            catch (FileNotFoundException)
+            {
+                // Positive evidence of absence from the open itself: there is no record.
+                return McpOwnershipSnapshot.Absent("no ownership record is present.");
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // The RunState directory itself is gone, so the record cannot exist.
+                return McpOwnershipSnapshot.Absent("no ownership record is present.");
             }
             catch (Exception ex)
             {
+                // Anything else - access denied, a sharing violation, a transient filesystem
+                // failure, a directory occupying the path - means the record may exist but could
+                // not be observed. Never report that as ABSENT: UNKNOWN must block every
+                // publication, adoption, promotion and deletion.
                 return McpOwnershipSnapshot.Unknown(
                     $"the ownership record could not be read: {ex.Message}");
             }
@@ -514,15 +539,23 @@ namespace MCPForUnity.Editor.Services.Route
 
             try
             {
-                if (File.Exists(_handshakePath))
-                {
-                    File.Delete(_handshakePath);
-                }
-
+                File.Delete(_handshakePath);
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                // Already gone: the record this decision was made about no longer exists.
+                return true;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // The RunState directory is gone, so no record of ours is left to remove.
                 return true;
             }
             catch (Exception ex)
             {
+                // Access denied / sharing violation: the record is still there and could not be
+                // removed, so the caller must not treat the deletion as having happened.
                 error = $"the ownership record could not be removed: {ex.Message}";
                 return false;
             }

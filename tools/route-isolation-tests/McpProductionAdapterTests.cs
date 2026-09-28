@@ -1056,7 +1056,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             const string branchLock =
                 "{ \"dependencies\": { \"com.coplaydev.unity-mcp\": { "
                 + "\"version\": \"https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#main\", "
-                + "\"source\": \"git\", \"hash\": \"main\" } } }";
+                + "\"source\": \"git\", \"hash\": \"main\", \"depth\": 0 } } }";
 
             Assert.That(
                 McpPackageLockProvenance.TryRead(

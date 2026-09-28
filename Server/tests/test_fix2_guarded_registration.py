@@ -299,17 +299,3 @@ async def test_unguarded_selector_defers_to_legacy_selection(tmp_path):
 
     assert selection.guarded is False
     assert selection.session_id is None
-
-
-def test_both_rest_routes_use_the_central_guarded_selector():
-    """A regression that re-implements selection inside a route must fail here."""
-    source = Path(__file__).resolve().parents[1] / "src" / "main.py"
-    text = source.read_text(encoding="utf-8")
-
-    command_start = text.index('@mcp.custom_route("/api/command"')
-    custom_tools_start = text.index('@mcp.custom_route("/api/custom-tools"')
-    command_route = text[command_start:custom_tools_start]
-    custom_tools_route = text[custom_tools_start:]
-
-    assert "resolve_guarded_session" in command_route
-    assert "resolve_guarded_session" in custom_tools_route

@@ -54,6 +54,21 @@ guarded registration (a second connection cannot take a reservation), reservatio
 failure, disconnect-driven release, and the central guarded dispatch selector both REST routes
 use.
 
+### C17-R3-FIX3 additions (`McpFix3Tests.cs`)
+
+| Area | Behaviour under test |
+| --- | --- |
+| `McpPackageLockProvenance` | an explicit integer `depth: 0` is required; missing, null, string, float and non-zero depths all fail closed |
+| `McpServerSourceResolver` (UPM URL) | exactly one `path=` parameter: duplicate keys, empty values, unexpected keys, empty components, malformed escapes and encoded separators are all refused |
+| `McpOwnershipMutation.TerminateIfStillOwned` | the final termination check re-observes the whole live tuple inside the critical section - a changed/vanished/unreadable PID file, a changed PID-file path, a missing or altered launch nonce, or a different record all refuse the kill |
+| `McpOwnershipStore` | an existing-but-unreadable record is UNKNOWN, never ABSENT, and blocks first publication, replacement, promotion and deletion |
+| `McpRouteConfiguration` | the managed host allowlist is exactly `localhost` / `127.0.0.1` / `::1`; `127.0.0.2` and every other 127/8 address are refused, while the legacy unmanaged validator keeps its wider loopback behaviour |
+
+The matching Python half lives in `Server/tests/test_fix3_guarded_rest_routes.py`, which executes
+the production `/api/command` and `/api/custom-tools` route bodies over a real Starlette ASGI
+transport against a registry that contains a foreign session (inserted first) plus the guarded
+session (inserted second).
+
 ## Companion checks
 
 * `tools/compile-check-dotnet.ps1` compiles the whole `MCPForUnity` Runtime + Editor assembly

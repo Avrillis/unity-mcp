@@ -277,12 +277,12 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            int port = GetPortFromEndpoint(endpoint);
             McpTerminationOutcome outcome = McpOwnershipMutation.TerminateIfStillOwned(
                 OwnershipLocks,
-                () => port > 0
-                    ? _processInspector.GetListeningProcessIds(port)
-                    : (IReadOnlyList<int>)Array.Empty<int>(),
+                // Re-observe the whole live ownership tuple inside the critical section: the
+                // record, the PID evidence, the launch nonce and the listener are all refreshed
+                // here so no observation that was made before the lock can authorize a kill.
+                () => BuildOwnershipObservation(record, endpoint),
                 record,
                 validatedStart,
                 handle,

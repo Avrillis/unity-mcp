@@ -405,24 +405,41 @@ namespace MCPForUnity.Editor.Services.Route
             string subPathValue = null;
             if (query != null)
             {
-                foreach (string part in query.Split('&'))
+                // Deliberately narrow: exactly one 'path' parameter with one unambiguous value.
+                // Duplicates, unknown keys, empty components and encoded separators are all
+                // refused rather than resolved to whichever component the parser happened to
+                // keep last - two readers must never disagree about which sub-path this names.
+                string[] parts = query.Split('&');
+                if (parts.Length != 1)
                 {
-                    if (part.Length == 0)
-                    {
-                        continue;
-                    }
-
-                    int equals = part.IndexOf('=');
-                    string key = equals < 0 ? part : part.Substring(0, equals);
-                    string value = equals < 0 ? string.Empty : part.Substring(equals + 1);
-                    if (!string.Equals(key, "path", StringComparison.OrdinalIgnoreCase))
-                    {
-                        error = $"the dependency URL carries an unsupported query parameter '{key}'.";
-                        return false;
-                    }
-
-                    subPathValue = value;
+                    error = "the dependency URL carries an ambiguous query string; "
+                            + "exactly one 'path' parameter is allowed.";
+                    return false;
                 }
+
+                string part = parts[0];
+                int equals = part.IndexOf('=');
+                if (equals <= 0)
+                {
+                    error = "the dependency URL carries a malformed query parameter.";
+                    return false;
+                }
+
+                string key = part.Substring(0, equals);
+                if (!string.Equals(key, "path", StringComparison.OrdinalIgnoreCase))
+                {
+                    error = $"the dependency URL carries an unsupported query parameter '{key}'.";
+                    return false;
+                }
+
+                if (!TryDecodeUnambiguousQueryValue(part.Substring(equals + 1), out string pathValue))
+                {
+                    error = "the dependency URL's 'path' parameter is empty or not an "
+                            + "unambiguous path value.";
+                    return false;
+                }
+
+                subPathValue = pathValue;
             }
 
             string path = uri.AbsolutePath;
@@ -546,6 +563,85 @@ namespace MCPForUnity.Editor.Services.Route
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Decodes one UPM query-parameter value, refusing anything that could make a single
+        /// component read as more than one.
+        ///
+        /// Percent escapes are decoded, but an escape that would reintroduce a query separator
+        /// (<c>&amp; = ? # %</c>) is refused: <c>?path=/A%26path=/B</c> names two paths to a
+        /// permissive reader and must not be silently collapsed to one. Malformed escapes are
+        /// refused too, so an undecodable value never falls through as a raw string.
+        /// </summary>
+        private static bool TryDecodeUnambiguousQueryValue(string raw, out string decoded)
+        {
+            decoded = null;
+            if (string.IsNullOrEmpty(raw))
+            {
+                return false;
+            }
+
+            var builder = new StringBuilder(raw.Length);
+            for (int i = 0; i < raw.Length; i++)
+            {
+                char c = raw[i];
+                if (c == '&' || c == '=' || c == '?' || c == '#')
+                {
+                    return false;
+                }
+
+                if (c != '%')
+                {
+                    builder.Append(c);
+                    continue;
+                }
+
+                if (i + 2 >= raw.Length)
+                {
+                    return false;
+                }
+
+                int high = HexDigitValue(raw[i + 1]);
+                int low = HexDigitValue(raw[i + 2]);
+                if (high < 0 || low < 0)
+                {
+                    return false;
+                }
+
+                char unescaped = (char)((high << 4) | low);
+                if (unescaped == '&' || unescaped == '=' || unescaped == '?'
+                    || unescaped == '#' || unescaped == '%')
+                {
+                    return false;
+                }
+
+                builder.Append(unescaped);
+                i += 2;
+            }
+
+            decoded = builder.ToString();
+            return decoded.Length > 0;
+        }
+
+        private static int HexDigitValue(char c)
+        {
+            if (c >= '0' && c <= '9')
+            {
+                return c - '0';
+            }
+
+            if (c >= 'a' && c <= 'f')
+            {
+                return c - 'a' + 10;
+            }
+
+            if (c >= 'A' && c <= 'F')
+            {
+                return c - 'A' + 10;
+            }
+
+            return -1;
         }
 
         private static string LeafName(string path)
@@ -724,7 +820,6 @@ namespace MCPForUnity.Editor.Services.Route
             string sourceKind = packageEntry.Value<string>("source");
             string version = packageEntry.Value<string>("version");
             string hash = packageEntry.Value<string>("hash");
-            int? depth = packageEntry.Value<int?>("depth");
 
             if (string.IsNullOrWhiteSpace(sourceKind))
             {
@@ -751,13 +846,32 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
+            // An explicit, integer, zero 'depth' is required. A missing, null, non-integer or
+            // non-zero depth is refused: inferring "direct dependency" from a default would let a
+            // transitively-installed copy of the package authorize a managed route.
+            JToken depthToken = packageEntry["depth"];
+            if (depthToken == null || depthToken.Type != JTokenType.Integer)
+            {
+                error = $"the lock entry for '{packageName}' does not declare an explicit "
+                        + "integer 'depth'.";
+                return false;
+            }
+
+            long depthValue = depthToken.Value<long>();
+            if (depthValue != 0)
+            {
+                error = $"the lock entry for '{packageName}' has depth {depthValue}; only a direct "
+                        + "(depth 0) dependency may authorize a managed route.";
+                return false;
+            }
+
             entry = new McpLockGitEntry
             {
                 PackageName = packageName,
                 SourceKind = sourceKind.Trim(),
                 RawVersion = version.Trim(),
                 Revision = hash.Trim(),
-                Depth = depth ?? 0,
+                Depth = 0,
             };
             return true;
         }
