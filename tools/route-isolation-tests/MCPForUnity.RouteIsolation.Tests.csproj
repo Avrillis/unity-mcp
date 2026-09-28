@@ -27,6 +27,8 @@
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRunStateFile.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRouteObservationBuilder.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedConnectionGate.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedPreConnectGate.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpOwnershipStore.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpTerminationIdentity.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerSourceResolver.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerEnvironmentSanitizer.cs" />

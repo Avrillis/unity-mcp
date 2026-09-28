@@ -121,7 +121,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void L_UnusableRecordIsReplaceable()
+        public void L_UnusableRecordIsUnknownAndNeverReplaceable()
         {
             var fixture = new OwnershipFixture();
             McpRunStateRecord broken = fixture.BuildRecord();
@@ -130,7 +130,9 @@ namespace MCPForUnity.RouteIsolation.Tests
             McpAdoptionOutcome outcome = McpOwnershipEvaluator.EvaluateAdoption(
                 broken, fixture.BuildObservation(), out _);
 
-            Assert.That(outcome, Is.EqualTo(McpAdoptionOutcome.Stale));
+            // A record that cannot be structurally trusted is UNKNOWN, not stale: overwriting it
+            // could destroy another editor's live ownership evidence.
+            Assert.That(outcome, Is.EqualTo(McpAdoptionOutcome.Unknown));
         }
 
         // ------------------------------------------------------------------ X

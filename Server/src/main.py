@@ -13,7 +13,6 @@ from transport.plugin_hub import PluginHub
 from transport.route_guard import (
     apply_guarded_binding_environment,
     build_guard,
-    get_active_guard,
     set_active_guard,
 )
 from services.custom_tool_service import (
@@ -430,28 +429,6 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                 if not command_type:
                     return JSONResponse({"success": False, "error": "Missing 'type' field"}, status_code=400)
 
-                # Dedicated route guard: this server serves exactly one Unity instance, so
-                # refuse any target that is not it (before looking anything up).
-                active_guard = get_active_guard()
-                guard_decision = active_guard.authorize_target(unity_instance)
-                if not guard_decision.allowed:
-                    return JSONResponse(
-                        {"success": False, "error": guard_decision.reason}, status_code=403
-                    )
-
-                # A guarded server has no "first available session": without a binding there is
-                # nothing it is allowed to dispatch to, and a binding is the only thing it may
-                # ever dispatch to.
-                bound_hash = active_guard.resolve_bound_hash() if active_guard.enabled else None
-                if active_guard.enabled and not bound_hash:
-                    return JSONResponse(
-                        {
-                            "success": False,
-                            "error": "No Unity instance is registered with this dedicated MCP server yet.",
-                        },
-                        status_code=503,
-                    )
-
                 # Get available sessions
                 sessions = await PluginHub.get_sessions()
                 if not sessions.sessions:
@@ -460,65 +437,68 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                         "error": "No Unity instances connected. Make sure Unity is running with MCP plugin."
                     }, status_code=503)
 
-                # Find target session
+                # Find the target session. A dedicated (guarded) server resolves its target through
+                # the ONE central guarded-session method, so it can only ever reach its own bound
+                # instance; ordinary first / active / default / project-name selection is
+                # unreachable there. An unguarded server keeps the existing selection behaviour.
                 session_id = None
                 session_details = None
-                instance_name, instance_hash = _normalize_instance_token(
-                    unity_instance)
-                if unity_instance:
-                    # Try to match by hash or project name
-                    for sid, details in sessions.sessions.items():
-                        if details.hash == instance_hash or details.project in (instance_name, unity_instance):
-                            session_id = sid
-                            session_details = details
-                            break
+                guarded_selection = await PluginHub.resolve_guarded_session(unity_instance)
 
-                # If a specific unity_instance was requested but not found, return an error
-                # (Check done here so execute_custom_tool can also validate the instance)
-                if unity_instance and not session_id:
-                    return JSONResponse(
-                        {
-                            "success": False,
-                            "error": f"Unity instance '{unity_instance}' not found",
-                        },
-                        status_code=404,
-                    )
+                if guarded_selection.guarded:
+                    if guarded_selection.error:
+                        return JSONResponse(
+                            {"success": False, "error": guarded_selection.error},
+                            status_code=guarded_selection.status_code,
+                        )
+                    session_id = guarded_selection.session_id
+                    session_details = sessions.sessions.get(session_id)
+                else:
+                    instance_name, instance_hash = _normalize_instance_token(unity_instance)
+                    if unity_instance:
+                        # Try to match by hash or project name
+                        for sid, details in sessions.sessions.items():
+                            if details.hash == instance_hash or details.project in (instance_name, unity_instance):
+                                session_id = sid
+                                session_details = details
+                                break
 
-                # If no specific unity_instance requested, use first available session
-                # (Must be done before execute_custom_tool check so all command types benefit)
-                if not session_id and bound_hash:
-                    for sid, details in sessions.sessions.items():
-                        if details.hash == bound_hash:
-                            session_id = sid
-                            session_details = details
-                            break
-
-                    if not session_id:
+                    # If a specific unity_instance was requested but not found, return an error
+                    # (Check done here so execute_custom_tool can also validate the instance)
+                    if unity_instance and not session_id:
                         return JSONResponse(
                             {
                                 "success": False,
-                                "error": "The dedicated Unity instance is not connected.",
+                                "error": f"Unity instance '{unity_instance}' not found",
                             },
-                            status_code=503,
+                            status_code=404,
                         )
 
-                if not session_id:
-                    try:
-                        session_id = next(iter(sessions.sessions.keys()))
-                        session_details = sessions.sessions.get(session_id)
-                    except StopIteration:
-                        # No sessions available - sessions.sessions is empty
-                        # This should not happen since we checked at line 378, but handle gracefully
+                    # If no specific unity_instance requested, use first available session
+                    # (Must be done before execute_custom_tool check so all command types benefit)
+                    if not session_id:
+                        session_id = next(iter(sessions.sessions.keys()), None)
+                        session_details = sessions.sessions.get(session_id) if session_id else None
+
+                    if not session_id:
                         return JSONResponse({
                             "success": False,
                             "error": "No Unity instances connected. Make sure Unity is running with MCP plugin."
                         }, status_code=503)
 
+                # The instance this dispatch may address: the bound hash in guarded mode, or the
+                # selected session's hash otherwise.
+                dispatch_hash = (
+                    guarded_selection.project_hash
+                    if guarded_selection.guarded
+                    else (session_details.hash if session_details else None)
+                )
+
                 # Custom tool execution - must be checked BEFORE the final PluginHub.send_command call
                 # This applies to both cases: with or without explicit unity_instance
                 if command_type == "execute_custom_tool":
                     # session_id and session_details are already set above
-                    if not session_id or not session_details:
+                    if not session_id or not dispatch_hash:
                         return JSONResponse(
                             {"success": False,
                                 "error": "No valid Unity session available for custom tool execution"},
@@ -548,9 +528,7 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                         )
 
                     # Prefer a concrete hash for project-scoped tools.
-                    unity_instance_hint = unity_instance
-                    if session_details and session_details.hash:
-                        unity_instance_hint = session_details.hash
+                    unity_instance_hint = dispatch_hash
 
                     project_id = resolve_project_id_for_unity_instance(
                         unity_instance_hint)
@@ -598,14 +576,6 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
             """REST endpoint to list custom tools for the active Unity project."""
             try:
                 unity_instance = request.query_params.get("instance")
-                instance_name, instance_hash = _normalize_instance_token(
-                    unity_instance)
-
-                guard_decision = get_active_guard().authorize_target(unity_instance)
-                if not guard_decision.allowed:
-                    return JSONResponse(
-                        {"success": False, "error": guard_decision.reason}, status_code=403
-                    )
 
                 sessions = await PluginHub.get_sessions()
                 if not sessions.sessions:
@@ -614,27 +584,45 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
                         "error": "No Unity instances connected. Make sure Unity is running with MCP plugin."
                     }, status_code=503)
 
+                # Resolve the target through the same central guarded-session method /api/command
+                # uses, so a dedicated server can never list another worker's tools.
+                guarded_selection = await PluginHub.resolve_guarded_session(unity_instance)
+
                 session_details = None
-                if unity_instance:
-                    # Try to match by hash or project name
-                    for _, details in sessions.sessions.items():
-                        if details.hash == instance_hash or details.project in (instance_name, unity_instance):
-                            session_details = details
-                            break
-                    if not session_details:
+                session_id = None
+
+                if guarded_selection.guarded:
+                    if guarded_selection.error:
                         return JSONResponse(
-                            {
-                                "success": False,
-                                "error": f"Unity instance '{unity_instance}' not found",
-                            },
-                            status_code=404,
+                            {"success": False, "error": guarded_selection.error},
+                            status_code=guarded_selection.status_code,
                         )
+                    session_id = guarded_selection.session_id
+                    session_details = sessions.sessions.get(session_id)
                 else:
-                    # No specific unity_instance requested: use first available session
-                    session_details = next(iter(sessions.sessions.values()))
+                    instance_name, instance_hash = _normalize_instance_token(unity_instance)
+                    if unity_instance:
+                        # Try to match by hash or project name
+                        for _, details in sessions.sessions.items():
+                            if details.hash == instance_hash or details.project in (instance_name, unity_instance):
+                                session_details = details
+                                break
+                        if not session_details:
+                            return JSONResponse(
+                                {
+                                    "success": False,
+                                    "error": f"Unity instance '{unity_instance}' not found",
+                                },
+                                status_code=404,
+                            )
+                    else:
+                        # No specific unity_instance requested: use first available session
+                        session_details = next(iter(sessions.sessions.values()))
 
                 unity_instance_hint = unity_instance
-                if session_details and session_details.hash:
+                if guarded_selection.guarded and guarded_selection.project_hash:
+                    unity_instance_hint = guarded_selection.project_hash
+                elif session_details and session_details.hash:
                     unity_instance_hint = session_details.hash
 
                 project_id = resolve_project_id_for_unity_instance(

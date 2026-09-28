@@ -156,7 +156,11 @@ namespace MCPForUnity.Editor.Services.Route
     /// </summary>
     public sealed class McpRunStateRecord
     {
-        public const int CurrentSchemaVersion = 1;
+        /// <summary>
+        /// Schema 2 adds <see cref="RecordId"/>: an unambiguous per-lifecycle publication identity
+        /// that conditional (compare-and-swap) mutations compare before they overwrite or delete.
+        /// </summary>
+        public const int CurrentSchemaVersion = 2;
 
         public const string LifecycleStarting = "starting";
         public const string LifecycleRunning = "running";
@@ -194,6 +198,42 @@ namespace MCPForUnity.Editor.Services.Route
 
         [JsonProperty("written_utc")]
         public string WrittenUtc { get; set; }
+
+        /// <summary>
+        /// Unique identity of one ownership publication. Generated per lifecycle and preserved
+        /// across that lifecycle's valid transitions (for example starting -> running); a successor
+        /// lifecycle always gets a new value, so a stale decision can never mutate it.
+        /// </summary>
+        [JsonProperty("record_id")]
+        public string RecordId { get; set; }
+
+        /// <summary>Creates a fresh, unique identity for one ownership lifecycle publication.</summary>
+        public static string NewRecordId() => Guid.NewGuid().ToString("N");
+
+        /// <summary>True when <paramref name="candidate"/> is a usable record identity token.</summary>
+        public static bool IsUsableRecordId(string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return false;
+            }
+
+            string trimmed = candidate.Trim();
+            if (trimmed.Length > 64 || trimmed != candidate)
+            {
+                return false;
+            }
+
+            foreach (char c in trimmed)
+            {
+                if (char.IsWhiteSpace(c) || char.IsControl(c) || c == '"' || c == '\\')
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         /// <summary>Serializes with the package's pinned, explicit JSON shape.</summary>
         public string ToJson()
@@ -293,6 +333,14 @@ namespace MCPForUnity.Editor.Services.Route
             if (!TryParseUtc(WrittenUtc, out _))
             {
                 error = "written_utc is missing or malformed.";
+                return false;
+            }
+
+            // Every published record must carry an identity that a conditional mutation can
+            // compare, otherwise a stale decision could overwrite or delete a successor's record.
+            if (!IsUsableRecordId(RecordId))
+            {
+                error = "record_id is missing or malformed.";
                 return false;
             }
 

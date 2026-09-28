@@ -148,8 +148,10 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void StateStore_AbandonedTempIsCleanedOnlyOnceItIsOld()
+        public void StateStore_AnOldTempFileIsNeverReclaimedOnAgeAlone()
         {
+            // Six hours of existence does not prove a temporary file's writer has exited, so an
+            // unrelated abandoned temporary is left in place and never removed by another writer.
             string oldTemp = McpRunStateFile.CreateUniqueTempPath(_directory);
             File.WriteAllText(oldTemp, "stale");
             File.SetLastWriteTimeUtc(oldTemp, DateTime.UtcNow - TimeSpan.FromDays(1));
@@ -159,13 +161,13 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             Assert.That(McpRunStateFile.TryWriteAtomic(RecordPath, "{\"v\":1}", out _), Is.True);
 
-            Assert.That(File.Exists(oldTemp), Is.False, "an abandoned temp is reclaimed");
-            Assert.That(File.Exists(freshTemp), Is.True, "a recent temp may still belong to a live writer");
+            Assert.That(File.Exists(oldTemp), Is.True, "age alone never authorises reclaiming a temp");
+            Assert.That(File.Exists(freshTemp), Is.True);
             Assert.That(File.ReadAllText(RecordPath), Is.EqualTo("{\"v\":1}"));
         }
 
         [Test]
-        public void StateStore_UnusableRecordIsReplaceableButNeverTreatedAsValid()
+        public void StateStore_UnusableRecordIsNeverTreatedAsValidNorReplaceable()
         {
             var fixture = new OwnershipFixture();
 
@@ -179,8 +181,8 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             McpAdoptionOutcome outcome = McpOwnershipEvaluator.EvaluateAdoption(
                 missingWriteTime, fixture.BuildObservation(), out string detail);
-            Assert.That(outcome, Is.EqualTo(McpAdoptionOutcome.Stale));
-            Assert.That(detail, Does.Contain("may be replaced"));
+            Assert.That(outcome, Is.EqualTo(McpAdoptionOutcome.Unknown));
+            Assert.That(detail, Does.Contain("unknown"));
         }
 
         // ============================================================
@@ -545,19 +547,60 @@ namespace MCPForUnity.RouteIsolation.Tests
         private const string ExpectedSource =
             "git+https://github.com/Avrillis/unity-mcp.git@30d22075093d1d35dfb0091c1c7550e9ad948577#subdirectory=Server";
 
+        private const string ManifestValue =
+            "https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#" + ForkCommit;
+
+        /// <summary>
+        /// Builds a fully coherent provenance set (executing package + manifest pin + lock entry)
+        /// that individual tests then perturb one corroborating source at a time.
+        /// </summary>
         private static McpServerPackageProvenance Provenance(
+            string installedName = McpServerSourceResolver.ApprovedPackageName,
             string sourceKind = "git",
-            string repository = ForkRepository,
-            string revision = ForkCommit)
+            string packageJsonName = McpServerSourceResolver.ApprovedPackageName,
+            string resolvedPath =
+                @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp@abc\MCPForUnity",
+            bool resolvedPathExists = true,
+            bool insidePackageCache = true,
+            bool hasManifestEntry = true,
+            bool directManifest = true,
+            string manifestPackageName = McpServerSourceResolver.ApprovedPackageName,
+            string manifestValue = ManifestValue,
+            bool hasLockEntry = true,
+            string lockSourceKind = "git",
+            string lockRepository = ForkRepository,
+            string lockRevision = ForkCommit,
+            int lockDepth = 0)
         {
             return new McpServerPackageProvenance
             {
-                PackageName = "com.coplaydev.unity-mcp",
-                SourceKind = sourceKind,
-                RepositoryUrl = repository,
-                ResolvedRevision = revision,
-                PackageResolvedPath =
-                    @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp@abc\MCPForUnity",
+                Installed = new McpInstalledPackageIdentity
+                {
+                    Name = installedName,
+                    SourceKind = sourceKind,
+                    ResolvedPath = resolvedPath,
+                    PackageJsonName = packageJsonName,
+                    ResolvedPathExists = resolvedPathExists,
+                    ResolvedPathInsideProjectPackageCache = insidePackageCache,
+                },
+                Manifest = hasManifestEntry
+                    ? new McpManifestGitDependency
+                    {
+                        PackageName = manifestPackageName,
+                        RawValue = manifestValue,
+                        IsDirectDependency = directManifest,
+                    }
+                    : null,
+                Lock = hasLockEntry
+                    ? new McpLockGitEntry
+                    {
+                        PackageName = McpServerSourceResolver.ApprovedPackageName,
+                        SourceKind = lockSourceKind,
+                        RawVersion = lockRepository + "?path=/MCPForUnity#main",
+                        Revision = lockRevision,
+                        Depth = lockDepth,
+                    }
+                    : null,
             };
         }
 
@@ -572,6 +615,248 @@ namespace MCPForUnity.RouteIsolation.Tests
             Assert.That(resolution.Revision, Is.EqualTo(ForkCommit));
         }
 
+        // ---------------------------------------------------------------
+        // Blocker 1: every independent provenance source must agree.
+        // ---------------------------------------------------------------
+
+        [Test]
+        public void Provenance_FloatingManifestIsRefusedEvenWhenTheLockHasAFullHash()
+        {
+            // The exact defect Sol found: a floating '#main' manifest with a resolved full
+            // commit in packages-lock.json must NOT authorize a managed route.
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(
+                    manifestValue: "https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#main",
+                    lockRevision: ForkCommit));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+            Assert.That(resolution.Category, Is.EqualTo("floating-or-malformed-revision"));
+        }
+
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity")]          // missing revision
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#main")]      // branch
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#v10.2.0")]   // tag
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075")]  // short id
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#")]
+        public void Provenance_UnpinnedManifestIsRefused(string manifestValue)
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(manifestValue: manifestValue));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+            Assert.That(resolution.Category, Is.Not.Null.And.Not.Empty);
+        }
+
+        [Test]
+        public void Provenance_MissingManifestEntryIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(hasManifestEntry: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("missing-manifest-dependency"));
+        }
+
+        [Test]
+        public void Provenance_IndirectOnlyManifestDependencyIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(directManifest: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("indirect-manifest-dependency"));
+        }
+
+        [Test]
+        public void Provenance_WrongManifestPackageNameIsRefused()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(manifestPackageName: "com.someone.else"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("indirect-manifest-dependency"));
+        }
+
+        [TestCase("com.someone.else")]
+        public void Provenance_WrongExecutingPackageIsRefused(string installedName)
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(installedName: installedName));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("unexpected-package"));
+        }
+
+        [Test]
+        public void Provenance_PackageJsonDisagreementIsRefused()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(packageJsonName: "com.someone.else"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("installed-metadata-mismatch"));
+        }
+
+        [TestCase("/OtherPath")]
+        [TestCase("/server")]
+        [TestCase("")]
+        public void Provenance_WrongSubpathIsRefused(string subPath)
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(
+                    manifestValue:
+                        "https://github.com/Avrillis/unity-mcp.git?path=" + subPath + "#" + ForkCommit));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+        }
+
+        [Test]
+        public void Provenance_MissingPathQueryIsRefused()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(
+                    manifestValue: "https://github.com/Avrillis/unity-mcp.git#" + ForkCommit));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("unexpected-subpath"));
+        }
+
+        [Test]
+        public void Provenance_ManifestAndLockRevisionDisagreementIsRefused()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(lockRevision: "c1ca730ed77946c4fc9895d12ab1e00c4bdff0a5"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("revision-mismatch"));
+        }
+
+        [Test]
+        public void Provenance_ManifestAndLockRepositoryDisagreementIsRefused()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(lockRepository: "https://github.com/CoplayDev/unity-mcp.git"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("repository-mismatch"));
+        }
+
+        [TestCase("https://user:secret-token@github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("https://token@github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        public void Provenance_CredentialBearingHttpsUrlIsRefusedAndNeverEchoed(string manifestValue)
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(manifestValue: manifestValue));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+            Assert.That(resolution.Error, Does.Not.Contain("secret-token"));
+            Assert.That(resolution.Error, Does.Not.Contain("token@"));
+        }
+
+        [TestCase("git@github.com:Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("ssh://git@github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("ssh://user:password@github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("git://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("http://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        public void Provenance_NonApprovedRepositoryFormsAreRefused(string manifestValue)
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(manifestValue: manifestValue));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+        }
+
+        [TestCase("not a url at all")]
+        [TestCase("https://github.com/Avrillis/unity-mcp/tree/main#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("https://127.0.0.1/Avrillis/unity-mcp.git?path=/MCPForUnity#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity&depth=1#30d22075093d1d35dfb0091c1c7550e9ad948577")]
+        public void Provenance_MalformedRepositoryIsRefused(string manifestValue)
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(manifestValue: manifestValue));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
+            Assert.That(resolution.Category, Is.Not.Null.And.Not.Empty);
+        }
+
+        [Test]
+        public void Provenance_InstalledPathOutsideThePackageCacheIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(insidePackageCache: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("installed-path-mismatch"));
+        }
+
+        [Test]
+        public void Provenance_ResolvedPathWhoseLeafIsNotMCPForUnityIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(
+                    Provenance(resolvedPath: @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp@abc"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("installed-path-mismatch"));
+        }
+
+        [Test]
+        public void Provenance_ResolvedPathOutsideThePackageCacheIsRefusedEvenWithTheRightLeaf()
+        {
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(
+                    resolvedPath: @"C:\proj\Assets\SomeOtherFolder\MCPForUnity",
+                    insidePackageCache: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("installed-path-mismatch"));
+        }
+
+        [Test]
+        public void Provenance_DisappearedResolvedPathIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(resolvedPathExists: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+        }
+
+        [Test]
+        public void Provenance_NonGitLockEntryIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(lockSourceKind: "embedded"));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("non-git-lock-entry"));
+        }
+
+        [Test]
+        public void Provenance_TransitiveLockEntryIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(lockDepth: 1));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("indirect-lock-entry"));
+        }
+
+        [Test]
+        public void Provenance_MissingLockEntryIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(Provenance(hasLockEntry: false));
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("missing-lock-entry"));
+        }
+
         [TestCase(null)]
         [TestCase("")]
         [TestCase("main")]
@@ -582,7 +867,10 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void SourceResolver_FloatingOrMalformedRevisionIsRefused(string revision)
         {
             McpServerSourceResolution resolution =
-                McpServerSourceResolver.ResolveManaged(Provenance(revision: revision));
+                McpServerSourceResolver.ResolveManaged(
+                    Provenance(
+                        manifestValue: "https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#"
+                                       + revision));
 
             Assert.That(resolution.IsResolved, Is.False);
             Assert.That(resolution.Source, Is.Null);
@@ -602,45 +890,6 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void SourceResolver_CredentialBearingUrlIsRefusedAndNeverEchoed()
-        {
-            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
-                Provenance(repository: "https://user:secret-token@github.com/Avrillis/unity-mcp.git"));
-
-            Assert.That(resolution.IsResolved, Is.False);
-            Assert.That(resolution.Source, Is.Null);
-            Assert.That(resolution.Error, Does.Not.Contain("secret-token"));
-            Assert.That(resolution.Error, Does.Not.Contain("user"));
-        }
-
-        [TestCase("ftp://github.com/Avrillis/unity-mcp.git")]
-        [TestCase("https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity")]
-        [TestCase("https://github.com/Avrillis/unity-mcp.git#main")]
-        [TestCase("not a url at all")]
-        public void SourceResolver_MalformedRepositoryIsRefused(string repository)
-        {
-            McpServerSourceResolution resolution =
-                McpServerSourceResolver.ResolveManaged(Provenance(repository: repository));
-
-            Assert.That(resolution.IsResolved, Is.False);
-            Assert.That(resolution.Source, Is.Null);
-        }
-
-        [Test]
-        public void SourceResolver_ScpStyleRemoteIsNormalized()
-        {
-            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
-                Provenance(repository: "git@github.com:Avrillis/unity-mcp.git"));
-
-            Assert.That(resolution.IsResolved, Is.True, resolution.Error);
-            Assert.That(
-                resolution.Source,
-                Is.EqualTo(
-                    "git+ssh://git@github.com/Avrillis/unity-mcp.git@"
-                    + ForkCommit + "#subdirectory=Server"));
-        }
-
-        [Test]
         public void SourceResolver_MissingProvenanceIsRefused()
         {
             McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(null);
@@ -654,7 +903,10 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void SourceResolver_RevisionIsNormalizedToLowerCase()
         {
             McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
-                Provenance(revision: ForkCommit.ToUpperInvariant()));
+                Provenance(
+                    manifestValue: "https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#"
+                                   + ForkCommit.ToUpperInvariant(),
+                    lockRevision: ForkCommit.ToUpperInvariant()));
 
             Assert.That(resolution.IsResolved, Is.True);
             Assert.That(resolution.Revision, Is.EqualTo(ForkCommit));
@@ -680,18 +932,85 @@ namespace MCPForUnity.RouteIsolation.Tests
             bool ok = McpPackageLockProvenance.TryRead(
                 LockJson,
                 "com.coplaydev.unity-mcp",
-                @"C:\proj\Library\PackageCache\pkg\MCPForUnity",
-                out McpServerPackageProvenance provenance,
+                out McpLockGitEntry entry,
                 out string error);
 
             Assert.That(ok, Is.True, error);
-            Assert.That(provenance.SourceKind, Is.EqualTo("git"));
-            Assert.That(provenance.RepositoryUrl, Is.EqualTo(ForkRepository));
-            Assert.That(provenance.ResolvedRevision, Is.EqualTo(ForkCommit));
+            Assert.That(entry.SourceKind, Is.EqualTo("git"));
+            Assert.That(entry.RawVersion, Does.StartWith(ForkRepository));
+            Assert.That(entry.Revision, Is.EqualTo(ForkCommit));
+            Assert.That(entry.Depth, Is.EqualTo(0));
+        }
 
-            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(provenance);
-            Assert.That(resolution.IsResolved, Is.True, resolution.Error);
-            Assert.That(resolution.Source, Is.EqualTo(ExpectedSource));
+        [Test]
+        public void LockFileProvenance_LockOnlyTrustIsNotEnough()
+        {
+            // Reading the lock file alone yields a lock entry, but a managed source still needs
+            // the corroborating executing package and manifest pin.
+            Assert.That(
+                McpPackageLockProvenance.TryRead(
+                    LockJson, "com.coplaydev.unity-mcp", out McpLockGitEntry entry, out _),
+                Is.True);
+
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                new McpServerPackageProvenance { Lock = entry });
+
+            Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Category, Is.EqualTo("missing-installed-package"));
+        }
+
+        [Test]
+        public void ManifestProvenance_ReadsDirectDependencyAndRejectsTransitiveOnly()
+        {
+            string manifest =
+                "{ \"dependencies\": { "
+                + "\"com.coplaydev.unity-mcp\": \"" + ManifestValue + "\", "
+                + "\"com.unity.ugui\": \"2.5.0\" } }";
+
+            Assert.That(
+                McpPackageManifestProvenance.TryRead(
+                    manifest, "com.coplaydev.unity-mcp",
+                    out McpManifestGitDependency dependency, out string error),
+                Is.True, error);
+            Assert.That(dependency.IsDirectDependency, Is.True);
+            Assert.That(dependency.RawValue, Is.EqualTo(ManifestValue));
+
+            // Present in the lock file, absent from the manifest: never a project-owned pin.
+            Assert.That(
+                McpPackageManifestProvenance.TryRead(
+                    manifest, "com.other.package", out _, out string missing),
+                Is.False);
+            Assert.That(missing, Does.Contain("com.other.package"));
+
+            Assert.That(
+                McpPackageManifestProvenance.TryRead(
+                    "{ \"dependencies\": { \"com.coplaydev.unity-mcp\": { \"version\": \"1\" } } }",
+                    "com.coplaydev.unity-mcp", out _, out _),
+                Is.False);
+            Assert.That(
+                McpPackageManifestProvenance.TryRead(
+                    "not json", "com.coplaydev.unity-mcp", out _, out string badJson),
+                Is.False);
+            Assert.That(badJson, Does.Contain("not valid JSON"));
+        }
+
+        [Test]
+        public void InstalledPackageMetadata_ReadsNameAndRejectsUnusable()
+        {
+            Assert.That(
+                McpInstalledPackageMetadata.TryRead(
+                    "{ \"name\": \"com.coplaydev.unity-mcp\", \"version\": \"10.2.0\" }",
+                    out string name, out string error),
+                Is.True, error);
+            Assert.That(name, Is.EqualTo("com.coplaydev.unity-mcp"));
+
+            Assert.That(
+                McpInstalledPackageMetadata.TryRead(
+                    "{ \"version\": \"10.2.0\" }", out _, out string noName),
+                Is.False);
+            Assert.That(noName, Does.Contain("name"));
+            Assert.That(
+                McpInstalledPackageMetadata.TryRead("", out _, out _), Is.False);
         }
 
         [Test]
@@ -699,14 +1018,14 @@ namespace MCPForUnity.RouteIsolation.Tests
         {
             Assert.That(
                 McpPackageLockProvenance.TryRead(
-                    LockJson, "com.other.package", null, out _, out string missingEntry),
+                    LockJson, "com.other.package", out _, out string missingEntry),
                 Is.False);
             Assert.That(missingEntry, Does.Contain("com.other.package"));
 
             Assert.That(
                 McpPackageLockProvenance.TryRead(
                     "{ \"dependencies\": { \"com.coplaydev.unity-mcp\": { \"source\": \"git\" } } }",
-                    "com.coplaydev.unity-mcp", null, out _, out string missingVersion),
+                    "com.coplaydev.unity-mcp", out _, out string missingVersion),
                 Is.False);
             Assert.That(missingVersion, Does.Contain("resolved version"));
 
@@ -714,19 +1033,19 @@ namespace MCPForUnity.RouteIsolation.Tests
                 McpPackageLockProvenance.TryRead(
                     "{ \"dependencies\": { \"com.coplaydev.unity-mcp\": "
                     + "{ \"source\": \"git\", \"version\": \"https://x/y.git\" } } }",
-                    "com.coplaydev.unity-mcp", null, out _, out string missingHash),
+                    "com.coplaydev.unity-mcp", out _, out string missingHash),
                 Is.False);
             Assert.That(missingHash, Does.Contain("resolved commit"));
 
             Assert.That(
                 McpPackageLockProvenance.TryRead(
-                    "not json", "com.coplaydev.unity-mcp", null, out _, out string badJson),
+                    "not json", "com.coplaydev.unity-mcp", out _, out string badJson),
                 Is.False);
             Assert.That(badJson, Does.Contain("not valid JSON"));
 
             Assert.That(
                 McpPackageLockProvenance.TryRead(
-                    "", "com.coplaydev.unity-mcp", null, out _, out string empty),
+                    "", "com.coplaydev.unity-mcp", out _, out string empty),
                 Is.False);
             Assert.That(empty, Does.Contain("packages-lock.json"));
         }
@@ -741,11 +1060,12 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             Assert.That(
                 McpPackageLockProvenance.TryRead(
-                    branchLock, "com.coplaydev.unity-mcp", null,
-                    out McpServerPackageProvenance provenance, out _),
+                    branchLock, "com.coplaydev.unity-mcp",
+                    out McpLockGitEntry entry, out _),
                 Is.True);
 
-            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(provenance);
+            McpServerSourceResolution resolution = McpServerSourceResolver.ResolveManaged(
+                Provenance(lockRevision: entry.Revision));
             Assert.That(resolution.IsResolved, Is.False);
             Assert.That(resolution.Category, Is.EqualTo("floating-or-malformed-revision"));
             Assert.That(resolution.Source, Is.Null);
@@ -1048,7 +1368,10 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void ManagedArguments_UnresolvedSourceIsNeverAResolvedFromArgument()
         {
             McpServerSourceResolution unresolved =
-                McpServerSourceResolver.ResolveManaged(Provenance(revision: "main"));
+                McpServerSourceResolver.ResolveManaged(
+                    Provenance(
+                        manifestValue:
+                            "https://github.com/Avrillis/unity-mcp.git?path=/MCPForUnity#main"));
 
             Assert.That(unresolved.IsResolved, Is.False);
             Assert.That(
@@ -1087,6 +1410,27 @@ namespace MCPForUnity.RouteIsolation.Tests
                 return McpRunStateRecord.TryParse(HandshakeJson, out record, out error);
             }
 
+            public McpOwnershipSnapshot ReadOwnershipState()
+            {
+                if (Unreadable)
+                {
+                    return McpOwnershipSnapshot.Unknown("the ownership record is unreadable.");
+                }
+
+                if (HandshakeJson == null)
+                {
+                    return McpOwnershipSnapshot.Absent("no ownership record is present.");
+                }
+
+                return McpRunStateRecord.TryParse(HandshakeJson, out McpRunStateRecord record, out string error)
+                    ? McpOwnershipSnapshot.Of(record)
+                    : McpOwnershipSnapshot.Unknown(error);
+            }
+
+            // This in-memory store is only used for observation/gate tests; ownership mutations in
+            // the termination tests run against the real file-backed McpOwnershipStore.
+            public IMcpOwnershipLockProvider OwnershipLocks => null;
+
             public bool Write(McpRunStateRecord record, out string error)
             {
                 error = null;
@@ -1102,6 +1446,8 @@ namespace MCPForUnity.RouteIsolation.Tests
             }
 
             public void DeleteRecord() => HandshakeJson = null;
+
+            public bool Unreadable { get; set; }
         }
 
         private sealed class FakeInspector : IMcpProcessInspector

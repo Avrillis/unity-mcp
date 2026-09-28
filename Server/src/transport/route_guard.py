@@ -117,6 +117,18 @@ class GuardDecision:
 class ManagedRouteGuard:
     """Binds one dedicated server instance to one Unity project identity."""
 
+    # Registration is an explicit state machine so a second connection can never take ownership
+    # while the first registration is still being completed.
+    #
+    #   UNBOUND     - nothing has registered yet.
+    #   REGISTERING - a connection has been authorised and reserved the binding, but its registry
+    #                 entry is not yet visible. Dispatch must fail; a second registration must not
+    #                 take the binding, and an "orphaned binding" check must not release it.
+    #   BOUND       - the reserved connection's registry entry is published and dispatchable.
+    BINDING_UNBOUND = "unbound"
+    BINDING_REGISTERING = "registering"
+    BINDING_BOUND = "bound"
+
     def __init__(
         self,
         project_root: str | None,
@@ -132,6 +144,7 @@ class ManagedRouteGuard:
         self._bound_project_hash: str | None = None
         self._bound_project_name: str | None = None
         self._bound_connection_id: str | None = None
+        self._binding_state = self.BINDING_UNBOUND
 
     # ---------------------------------------------------------------- properties
     @property
@@ -171,8 +184,18 @@ class ManagedRouteGuard:
 
     @property
     def has_bound_instance(self) -> bool:
-        """True while a Unity connection is bound to this dedicated server."""
-        return self._bound_project_hash is not None
+        """True only while a Unity connection is fully bound and dispatchable."""
+        return self._binding_state == self.BINDING_BOUND
+
+    @property
+    def binding_state(self) -> str:
+        """One of UNBOUND / REGISTERING / BOUND."""
+        return self._binding_state
+
+    @property
+    def is_registering(self) -> bool:
+        """True while a registration has reserved the binding but is not yet visible."""
+        return self._binding_state == self.BINDING_REGISTERING
 
     def describe(self) -> str:
         if not self.enabled:
@@ -187,8 +210,13 @@ class ManagedRouteGuard:
 
         Used for absent-target dispatch and for resolving a session without ever falling
         back to ordinary first/active/default instance selection.
+
+        A registration that is still in progress yields None: a reserved-but-unpublished binding
+        must not authorise dispatch.
         """
         if not self.enabled:
+            return None
+        if self._binding_state != self.BINDING_BOUND:
             return None
         return self._bound_project_hash
 
@@ -240,9 +268,16 @@ class ManagedRouteGuard:
 
         # Exactly one bound Unity connection. A reconnect of the SAME logical guarded identity
         # (same project + same nonce) is only accepted once the previous connection is gone -
-        # the hub releases the binding on disconnect. While a binding is live, a second
-        # registration cannot take it over, even with identical root and nonce.
-        if self._bound_project_hash is not None:
+        # the hub releases the binding on disconnect. While a binding is live - or while another
+        # registration is mid-flight - a second registration cannot take it over, even with
+        # identical root and nonce.
+        if self._binding_state == self.BINDING_REGISTERING:
+            return GuardDecision(
+                False,
+                "another registration is already in progress for this dedicated MCP server",
+            )
+
+        if self._binding_state == self.BINDING_BOUND:
             same_connection = (
                 connection_id is not None
                 and self._bound_connection_id is not None
@@ -253,18 +288,32 @@ class ManagedRouteGuard:
                     False,
                     "another Unity connection is already bound to this dedicated MCP server",
                 )
-        else:
-            self._bound_connection_id = connection_id
 
+            # Idempotent re-registration by the already-bound connection.
+            return GuardDecision(True)
+
+        # Reserve the binding. It becomes dispatchable only once the hub publishes the session.
+        self._bound_connection_id = connection_id
         self._bound_project_hash = project_hash
         self._bound_project_name = project_name or None
+        self._binding_state = self.BINDING_REGISTERING
         return GuardDecision(True)
+
+    def mark_bound(self) -> None:
+        """Publish a reserved binding once its registry entry is visible.
+
+        Called by the hub after the registry insertion completes, still inside the same guarded
+        registration transition.
+        """
+        if self._binding_state == self.BINDING_REGISTERING:
+            self._binding_state = self.BINDING_BOUND
 
     def release_binding(self) -> None:
         """Forget the bound instance (the guarded session disconnected)."""
         self._bound_project_hash = None
         self._bound_project_name = None
         self._bound_connection_id = None
+        self._binding_state = self.BINDING_UNBOUND
 
     # ---------------------------------------------------------------- dispatch
     def authorize_target(self, unity_instance: str | None) -> GuardDecision:
@@ -285,23 +334,16 @@ class ManagedRouteGuard:
             )
 
         if unity_instance is None or not str(unity_instance).strip():
-            if self._bound_project_hash is None:
-                return GuardDecision(
-                    False,
-                    "no Unity instance is registered with this dedicated MCP server yet",
-                )
-            return GuardDecision(True)
+            return self._require_bound_instance()
 
         target = str(unity_instance).strip()
 
+        binding_check = self._require_bound_instance()
+        if not binding_check.allowed:
+            return binding_check
+
         bound_hash = self._bound_project_hash
         bound_name = self._bound_project_name or ""
-
-        if bound_hash is None:
-            # Nothing has registered yet; there is no identity to check against, so refuse
-            # rather than let the caller fall through to a different instance.
-            return GuardDecision(
-                False, "no Unity instance is registered with this dedicated server yet")
 
         if "@" in target:
             target_name, _, target_hash = target.rpartition("@")
@@ -318,6 +360,22 @@ class ManagedRouteGuard:
         return GuardDecision(
             False,
             "targeting a Unity instance other than this dedicated server's own instance is refused",
+        )
+
+    def _require_bound_instance(self) -> GuardDecision:
+        """Dispatch is allowed only once a registration has fully published its binding."""
+        if self._binding_state == self.BINDING_BOUND:
+            return GuardDecision(True)
+
+        if self._binding_state == self.BINDING_REGISTERING:
+            return GuardDecision(
+                False,
+                "this dedicated MCP server's Unity registration is not complete yet",
+            )
+
+        return GuardDecision(
+            False,
+            "no Unity instance is registered with this dedicated MCP server yet",
         )
 
 

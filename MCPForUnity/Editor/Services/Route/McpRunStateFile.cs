@@ -18,6 +18,9 @@ namespace MCPForUnity.Editor.Services.Route
     ///     which is atomic on NTFS and a rename on POSIX;
     ///   * the previous record is NEVER deleted first. If the atomic replacement is unavailable
     ///     or fails, the write fails closed and the previous record stays intact.
+    ///   * each writer removes only its own uniquely named temporary in its own failure path.
+    ///     An unrelated leftover temporary is harmless and is never reclaimed on age alone: how
+    ///     long a file has existed does not prove its writer has exited.
     ///
     /// This type is deliberately free of Unity dependencies so the publication rules can be
     /// exercised without an Editor.
@@ -29,12 +32,6 @@ namespace MCPForUnity.Editor.Services.Route
 
         /// <summary>Suffix of the unique per-writer temporary file name.</summary>
         public const string TempFileSuffix = ".tmp";
-
-        /// <summary>
-        /// Abandoned temporaries younger than this are left alone: they may still belong to a
-        /// writer that is mid-publication.
-        /// </summary>
-        public static readonly TimeSpan AbandonedTempAge = TimeSpan.FromHours(6);
 
         /// <summary>
         /// Writes <paramref name="content"/> to <paramref name="destinationPath"/> atomically.
@@ -62,7 +59,6 @@ namespace MCPForUnity.Editor.Services.Route
             try
             {
                 Directory.CreateDirectory(directory);
-                CleanupAbandonedTemps(directory);
 
                 tempPath = CreateUniqueTempPath(directory);
                 using (var stream = new FileStream(
@@ -100,44 +96,6 @@ namespace MCPForUnity.Editor.Services.Route
             return Path.Combine(
                 directory,
                 TempFilePrefix + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture) + TempFileSuffix);
-        }
-
-        /// <summary>
-        /// Removes temporaries old enough that no live writer can still own them. Best effort:
-        /// failures are ignored because a leftover temporary never affects ownership.
-        /// </summary>
-        public static void CleanupAbandonedTemps(string directory)
-        {
-            try
-            {
-                if (!Directory.Exists(directory))
-                {
-                    return;
-                }
-
-                DateTime cutoff = DateTime.UtcNow - AbandonedTempAge;
-                foreach (string candidate in Directory.GetFiles(
-                             directory,
-                             TempFilePrefix + "*" + TempFileSuffix,
-                             SearchOption.TopDirectoryOnly))
-                {
-                    try
-                    {
-                        if (File.GetLastWriteTimeUtc(candidate) < cutoff)
-                        {
-                            TryDelete(candidate);
-                        }
-                    }
-                    catch
-                    {
-                        // Ignore an individual temporary; ownership never depends on it.
-                    }
-                }
-            }
-            catch
-            {
-                // Never let housekeeping fail a write.
-            }
         }
 
         private static void Publish(string tempPath, string destinationPath)

@@ -9,6 +9,7 @@ namespace MCPForUnity.Editor.Services.Route
     public sealed class McpRouteStateStore : IMcpRouteStateStore
     {
         private readonly string _projectRoot;
+        private readonly McpOwnershipStore _ownership;
 
         public McpRouteStateStore() : this(ResolveProjectRoot())
         {
@@ -17,6 +18,7 @@ namespace MCPForUnity.Editor.Services.Route
         public McpRouteStateStore(string canonicalProjectRoot)
         {
             _projectRoot = McpRunStatePaths.Canonicalize(canonicalProjectRoot);
+            _ownership = new McpOwnershipStore(McpRunStatePaths.GetHandshakePath(_projectRoot));
         }
 
         /// <summary>Canonical project root for the running editor.</summary>
@@ -57,42 +59,17 @@ namespace MCPForUnity.Editor.Services.Route
         /// <inheritdoc/>
         public bool TryRead(out McpRunStateRecord record, out string error)
         {
-            record = null;
-            error = null;
-
-            string path = GetHandshakePath();
-            if (string.IsNullOrEmpty(path))
-            {
-                error = "the project-local RunState directory could not be resolved.";
-                return false;
-            }
-
-            if (!File.Exists(path))
-            {
-                error = "no ownership record is present.";
-                return false;
-            }
-
-            string json;
-            try
-            {
-                json = File.ReadAllText(path, Encoding.UTF8);
-            }
-            catch (Exception ex)
-            {
-                error = $"the ownership record at '{path}' could not be read: {ex.Message}";
-                return false;
-            }
-
-            if (!McpRunStateRecord.TryParse(json, out record, out string parseError))
-            {
-                error = $"the ownership record at '{path}' is unusable: {parseError}";
-                record = null;
-                return false;
-            }
-
-            return true;
+            McpOwnershipSnapshot snapshot = ReadOwnershipState();
+            record = snapshot.IsPresent ? snapshot.Record : null;
+            error = snapshot.IsPresent ? null : snapshot.Detail;
+            return snapshot.IsPresent;
         }
+
+        /// <inheritdoc/>
+        public McpOwnershipSnapshot ReadOwnershipState() => _ownership.Read();
+
+        /// <inheritdoc/>
+        public IMcpOwnershipLockProvider OwnershipLocks => _ownership;
 
         /// <inheritdoc/>
         public bool Write(McpRunStateRecord record, out string error)

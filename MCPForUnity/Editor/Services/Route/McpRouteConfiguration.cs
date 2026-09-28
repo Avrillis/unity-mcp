@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 
 namespace MCPForUnity.Editor.Services.Route
 {
@@ -153,9 +154,11 @@ namespace MCPForUnity.Editor.Services.Route
             // ---- HTTP URL --------------------------------------------------------
             if (config.HasHttpUrlOverride)
             {
-                if (!TryValidateLocalHttpUrl(
+                // A process-scoped (managed) URL has a stricter contract than a stored one: it must
+                // describe exactly the loopback server this editor launches, so it may neither rely
+                // on the scheme's default port nor on the legacy LAN opt-in.
+                if (!TryValidateManagedHttpUrl(
                         inputs.HttpUrlEnvironmentValue,
-                        inputs.StoredAllowLanBind,
                         out string normalized,
                         out string urlError))
                 {
@@ -290,6 +293,127 @@ namespace MCPForUnity.Editor.Services.Route
 
             normalized = BuildNormalizedBaseUrl(uri);
             return true;
+        }
+
+        /// <summary>
+        /// Validates and normalizes a MANAGED (process-scoped) local HTTP base URL.
+        ///
+        /// The extra rules over <see cref="TryValidateLocalHttpUrl"/> are what stop a managed route
+        /// from silently describing a different endpoint than the one this editor launches:
+        ///   * the URL text must carry an explicit TCP port - <see cref="Uri.Port"/> reports the
+        ///     scheme default (80 for http) when no port was written, so a portless URL would
+        ///     otherwise masquerade as a concrete endpoint;
+        ///   * only loopback hosts are permitted; the legacy LAN/bind-all opt-in does not apply.
+        /// </summary>
+        public static bool TryValidateManagedHttpUrl(
+            string value,
+            out string normalized,
+            out string error)
+        {
+            normalized = null;
+            error = null;
+
+            if (!TryGetExplicitPort(value, out int explicitPort))
+            {
+                error = "managed routes require an explicitly written loopback port "
+                        + "(for example http://127.0.0.1:8081); the scheme default port is not allowed.";
+                return false;
+            }
+
+            // Loopback-only, and never the LAN opt-in: managed routes are local to one editor.
+            if (!TryValidateLocalHttpUrl(value, allowLanBind: false, out normalized, out error))
+            {
+                return false;
+            }
+
+            if (Uri.TryCreate(value.Trim(), UriKind.Absolute, out Uri uri) && uri.Port != explicitPort)
+            {
+                normalized = null;
+                error = "the URL's explicit port could not be parsed consistently.";
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Extracts the explicitly written TCP port from raw URL text, or returns false when the
+        /// authority carries no port. This deliberately inspects the text rather than
+        /// <see cref="Uri.Port"/>, which reports the scheme default for a portless URL.
+        /// </summary>
+        public static bool TryGetExplicitPort(string rawUrl, out int port)
+        {
+            port = 0;
+            if (string.IsNullOrWhiteSpace(rawUrl))
+            {
+                return false;
+            }
+
+            string trimmed = rawUrl.Trim();
+            int schemeEnd = trimmed.IndexOf("://", StringComparison.Ordinal);
+            if (schemeEnd < 0)
+            {
+                return false;
+            }
+
+            int authorityStart = schemeEnd + 3;
+            int authorityEnd = trimmed.Length;
+            foreach (char terminator in new[] { '/', '?', '#' })
+            {
+                int index = trimmed.IndexOf(terminator, authorityStart);
+                if (index >= 0 && index < authorityEnd)
+                {
+                    authorityEnd = index;
+                }
+            }
+
+            string authority = trimmed.Substring(authorityStart, authorityEnd - authorityStart);
+            int hostStart = authority.LastIndexOf('@') + 1;
+            if (hostStart >= authority.Length)
+            {
+                return false;
+            }
+
+            int hostEnd;
+            if (authority[hostStart] == '[')
+            {
+                int close = authority.IndexOf(']', hostStart);
+                if (close < 0)
+                {
+                    return false;
+                }
+
+                hostEnd = close + 1;
+            }
+            else
+            {
+                int colon = authority.IndexOf(':', hostStart);
+                hostEnd = colon < 0 ? authority.Length : colon;
+            }
+
+            if (hostEnd >= authority.Length || authority[hostEnd] != ':')
+            {
+                return false;
+            }
+
+            string portText = authority.Substring(hostEnd + 1);
+            if (portText.Length == 0)
+            {
+                return false;
+            }
+
+            foreach (char c in portText)
+            {
+                if (c < '0' || c > '9')
+                {
+                    return false;
+                }
+            }
+
+            return int.TryParse(
+                       portText, NumberStyles.None, CultureInfo.InvariantCulture, out port)
+                   && port > 0
+                   && port <= 65535;
         }
 
         /// <summary>

@@ -37,6 +37,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         public string Nonce = DefaultNonce;
         public string LifecycleState = McpRunStateRecord.LifecycleRunning;
         public DateTime WrittenAt = DefaultWrittenAt;
+        public string RecordId = "9f1c4a2b7d3e4568a0b1c2d3e4f50617";
 
         public static OwnershipFixture ForProject(string projectRoot, string endpoint, string nonce)
             => new OwnershipFixture
@@ -55,6 +56,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             return new McpRunStateRecord
             {
                 SchemaVersion = McpRunStateRecord.CurrentSchemaVersion,
+                RecordId = RecordId,
                 CanonicalProjectRoot = canonicalRoot,
                 Endpoint = Endpoint,
                 EditorPid = EditorPid,

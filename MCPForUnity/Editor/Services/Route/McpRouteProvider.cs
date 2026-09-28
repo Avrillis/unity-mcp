@@ -168,14 +168,20 @@ namespace MCPForUnity.Editor.Services.Route
                 }
 
                 McpRouteStateStore store = GetOrCreateDefaultStore();
-                if (!store.TryRead(out McpRunStateRecord record, out string readError) || record == null)
+                McpOwnershipSnapshot snapshot = store.ReadOwnershipState();
+                if (!snapshot.IsPresent)
                 {
-                    reason = McpOwnershipDenyReason.NoRecord;
-                    detail = readError;
+                    // An unreadable or malformed record is UNKNOWN, not "absent": either way the
+                    // nonce is withheld, but the two are reported distinctly.
+                    reason = snapshot.IsUnknown
+                        ? McpOwnershipDenyReason.MalformedRecord
+                        : McpOwnershipDenyReason.NoRecord;
+                    detail = snapshot.Detail;
                     McpLog.Debug($"[MCP Route] Not echoing a launch nonce: {detail}");
                     return false;
                 }
 
+                McpRunStateRecord record = snapshot.Record;
                 McpProcessInspector inspector = GetOrCreateProcessInspector();
                 McpOwnershipObservation observation = McpRouteObservationBuilder.Build(
                     store,

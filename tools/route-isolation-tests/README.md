@@ -39,6 +39,21 @@ substituted:
 | `McpManagedServerArguments` | guarded launch argument construction (pidfile + nonce) and fail-closed tokens |
 | `McpRouteObservationBuilder` | the live observation used by the gate and the stop path |
 
+### C17-R3-FIX2 additions (`McpFix2Tests.cs`)
+
+| Adapter | Behaviour under test |
+| --- | --- |
+| `McpManagedPreConnectGate` | the managed pre-connect authorization is ordered strictly before any socket open; an unproven/stale/copied/foreign/wrong-endpoint ownership state never opens a connection |
+| `McpOwnershipMutation` | termination final revalidation inside the cross-process critical section (record, listener and retained-lifetime re-checks; conditional deletion) |
+| `McpOwnershipStore` | the real file-backed ownership store: conditional publish/delete, malformed/unreadable state blocking, cross-process lock failure, first-publication races |
+| `McpRouteConfiguration` | the managed URL contract: explicit textual port required, loopback only, LAN opt-in ignored |
+| `McpRunStateRecord` | per-lifecycle `record_id` identity and its survival across a valid `starting -> running` transition |
+
+The Python half of FIX2 lives in `Server/tests/test_fix2_guarded_registration.py`: serialised
+guarded registration (a second connection cannot take a reservation), reservation rollback on
+failure, disconnect-driven release, and the central guarded dispatch selector both REST routes
+use.
+
 ## Companion checks
 
 * `tools/compile-check-dotnet.ps1` compiles the whole `MCPForUnity` Runtime + Editor assembly

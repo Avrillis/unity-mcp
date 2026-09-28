@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 import weakref
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from starlette.endpoints import WebSocketEndpoint
@@ -122,6 +123,23 @@ class CrossTargetDispatchError(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class DispatchSelection:
+    """Outcome of resolving the one Unity session a dispatch may reach.
+
+    ``guarded`` is False for an unguarded server, in which case the caller keeps the existing
+    multi-instance selection behaviour. For a guarded server ``session_id`` is set only when the
+    currently bound instance is present, and ``error`` describes a fail-closed refusal.
+    """
+
+    guarded: bool = False
+    session_id: str | None = None
+    project_hash: str | None = None
+    project_name: str | None = None
+    error: str | None = None
+    status_code: int = 200
+
+
 class PluginHub(WebSocketEndpoint):
     """Manages persistent WebSocket connections to Unity plugins."""
 
@@ -156,6 +174,10 @@ class PluginHub(WebSocketEndpoint):
     _last_pong: ClassVar[dict[str, float]] = {}
     # session_id -> ping task
     _ping_tasks: ClassVar[dict[str, asyncio.Task]] = {}
+    # Serialises the whole guarded registration transition (inspect binding -> authorise -> reserve
+    # -> publish the registry/session entry). Without it, two concurrent registrations can both
+    # observe the binding as apparently orphaned before either one is inserted into the registry.
+    _guard_transition_lock: ClassVar[asyncio.Lock | None] = None
 
     @classmethod
     def configure(
@@ -169,6 +191,7 @@ class PluginHub(WebSocketEndpoint):
         cls._loop = loop or asyncio.get_running_loop()
         # Ensure coordination primitives are bound to the configured loop
         cls._lock = asyncio.Lock()
+        cls._guard_transition_lock = asyncio.Lock()
         # Start tracking MCP client sessions for tool-change notifications
         if mcp is not None:
             _install_session_tracking()
@@ -260,6 +283,7 @@ class PluginHub(WebSocketEndpoint):
         lock = cls._lock
         if lock is None:
             return
+        session_id = None
         async with lock:
             session_id = next(
                 (sid for sid, ws in cls._connections.items() if ws is websocket), None)
@@ -291,9 +315,33 @@ class PluginHub(WebSocketEndpoint):
                         )
                 if cls._registry:
                     await cls._registry.unregister(session_id)
-                    await cls._release_guard_binding_if_orphaned()
-                logger.info(
-                    f"Plugin session {session_id} disconnected ({close_code})")
+
+        if session_id:
+            # Released OUTSIDE the connection lock: the guarded release takes the registration
+            # transition lock, and a registration takes that transition lock before it takes the
+            # connection lock - holding both here would deadlock against it.
+            await cls._release_guard_binding_if_orphaned()
+            logger.info(
+                f"Plugin session {session_id} disconnected ({close_code})")
+
+    @classmethod
+    async def _release_guard_binding_locked(cls) -> None:
+        """Drop the guarded binding if its bound session is genuinely gone.
+
+        Caller MUST hold :attr:`_guard_transition_lock`, so the check and the release cannot race a
+        registration that is reserving or publishing the binding. A binding that is merely
+        REGISTERING is never released: its session entry simply is not visible yet.
+        """
+        guard = get_active_guard()
+        if not guard.enabled or not guard.has_bound_instance or cls._registry is None:
+            return
+
+        if not await cls._registry.get_session_id_by_hash(guard.bound_project_hash):
+            logger.info(
+                "Guarded binding for project hash %s is orphaned; releasing it",
+                guard.bound_project_hash,
+            )
+            guard.release_binding()
 
     @classmethod
     async def _release_guard_binding_if_orphaned(cls) -> None:
@@ -306,8 +354,12 @@ class PluginHub(WebSocketEndpoint):
         if not guard.enabled or not guard.has_bound_instance or cls._registry is None:
             return
 
-        if not await cls._registry.get_session_id_by_hash(guard.bound_project_hash):
-            guard.release_binding()
+        transition_lock = cls._guard_transition_lock
+        if transition_lock is None:
+            return
+
+        async with transition_lock:
+            await cls._release_guard_binding_locked()
 
     @staticmethod
     def _connection_identity(websocket: Any) -> str:
@@ -490,27 +542,70 @@ class PluginHub(WebSocketEndpoint):
 
         # Dedicated-server route guard: bind this server to exactly one Unity project and
         # reject any foreign registration (wrong project or wrong/missing launch nonce).
-        # A binding left behind by a connection that is already gone is released first, so a
-        # genuine reconnect of the same guarded identity can re-bind; a binding whose session is
-        # still live is never released here, so a second connection cannot take it over.
         guard = get_active_guard()
         if guard.enabled:
-            await cls._release_guard_binding_if_orphaned()
-            decision = guard.authorize_registration(
-                project_name=project_name,
-                project_hash=project_hash,
-                project_path=project_path,
-                canonical_root=payload.canonical_project_root,
-                instance_token=payload.instance_token,
-                connection_id=cls._connection_identity(websocket),
-            )
-            if not decision.allowed:
-                logger.warning(
-                    "Rejected Unity registration for project %s (hash=%s): %s",
-                    project_name, project_hash, decision.reason,
+            transition_lock = cls._guard_transition_lock
+            if transition_lock is None:
+                await websocket.close(code=1011)
+                raise RuntimeError("PluginHub guarded registration lock not configured")
+
+            # The whole guarded transition is serialised: inspect the current binding, determine
+            # whether a previous binding is genuinely gone, authorise this connection, reserve the
+            # binding and publish the registry/session entry that makes it visible. A second
+            # registration cannot slip in between those steps.
+            async with transition_lock:
+                # A binding left behind by a connection that is already gone is released first, so
+                # a genuine reconnect of the same guarded identity can re-bind. A binding whose
+                # session is still live - or which is merely mid-registration - is never released.
+                await cls._release_guard_binding_locked()
+
+                decision = guard.authorize_registration(
+                    project_name=project_name,
+                    project_hash=project_hash,
+                    project_path=project_path,
+                    canonical_root=payload.canonical_project_root,
+                    instance_token=payload.instance_token,
+                    connection_id=cls._connection_identity(websocket),
                 )
-                await websocket.close(code=4403)
-                return
+                if not decision.allowed:
+                    logger.warning(
+                        "Rejected Unity registration for project %s (hash=%s): %s",
+                        project_name, project_hash, decision.reason,
+                    )
+                    await websocket.close(code=4403)
+                    return
+
+                try:
+                    await cls._complete_registration(
+                        websocket, payload, registry, lock, guard=guard)
+                except Exception:
+                    # A registration that failed after reserving must not leave the binding
+                    # reserved forever, or the route could never be used again.
+                    guard.release_binding()
+                    raise
+
+            return
+
+        await cls._complete_registration(websocket, payload, registry, lock, guard=None)
+
+    @classmethod
+    async def _complete_registration(
+        cls,
+        websocket: WebSocket,
+        payload: RegisterMessage,
+        registry: PluginRegistry,
+        lock: asyncio.Lock,
+        guard: Any | None = None,
+    ) -> None:
+        """Publish one Unity registration and, for a guarded server, its binding.
+
+        For a guarded server this runs inside the registration transition lock, so the binding
+        becomes visible only together with the registry entry it authorises.
+        """
+        project_name = payload.project_name
+        project_hash = payload.project_hash
+        unity_version = payload.unity_version
+        project_path = payload.project_path
 
         # Get user_id from websocket state (set during API key validation)
         user_id = getattr(websocket.state, "user_id", None)
@@ -561,6 +656,10 @@ class PluginHub(WebSocketEndpoint):
             # Start the server-side ping loop
             ping_task = asyncio.create_task(cls._ping_loop(session_id, websocket))
             cls._ping_tasks[session_id] = ping_task
+
+        # The registry entry is now visible, so the guarded binding can be published as dispatchable.
+        if guard is not None and guard.enabled:
+            guard.mark_bound()
 
         # Close evicted WebSocket outside the lock to avoid blocking
         if evicted_ws is not None:
@@ -916,6 +1015,65 @@ class PluginHub(WebSocketEndpoint):
     # Session resolution helpers
     # ------------------------------------------------------------------
     @classmethod
+    async def resolve_guarded_session(
+        cls,
+        unity_instance: str | None,
+        user_id: str | None = None,
+    ) -> DispatchSelection:
+        """The single guarded dispatch-selection method.
+
+        Every guarded dispatch path - tool and resource calls, ``/api/command`` and
+        ``/api/custom-tools`` - resolves its target through here, so there is exactly one place
+        that decides which Unity session a dedicated server may reach. Ordinary first / active /
+        default / project-name selection is never reachable in guarded mode.
+        """
+        guard = get_active_guard()
+        if not guard.enabled:
+            return DispatchSelection(guarded=False)
+
+        bound_hash = guard.resolve_bound_hash()
+        if not bound_hash:
+            # Nothing is dispatchable yet: either no registration has happened, or one is still
+            # being published. Either way the caller gets no session and no fallback selection.
+            return DispatchSelection(
+                guarded=True,
+                error=(
+                    "This dedicated MCP server's Unity registration is not complete yet."
+                    if guard.is_registering
+                    else "No Unity instance is registered with this dedicated MCP server yet."
+                ),
+                status_code=503,
+            )
+
+        decision = guard.authorize_target(unity_instance)
+        if not decision.allowed:
+            return DispatchSelection(guarded=True, error=decision.reason, status_code=403)
+
+        if cls._registry is None:
+            return DispatchSelection(
+                guarded=True, error="Plugin registry not configured", status_code=503)
+
+        if config.http_remote_hosted and user_id:
+            session_id = await cls._registry.get_session_id_by_hash(bound_hash, user_id)
+        else:
+            session_id = await cls._registry.get_session_id_by_hash(bound_hash)
+
+        if not session_id:
+            return DispatchSelection(
+                guarded=True,
+                error="The dedicated Unity instance is not connected.",
+                status_code=503,
+            )
+
+        session = await cls._registry.get_session(session_id)
+        return DispatchSelection(
+            guarded=True,
+            session_id=session_id,
+            project_hash=bound_hash,
+            project_name=getattr(session, "project_name", None),
+        )
+
+    @classmethod
     async def _resolve_session_id(
         cls,
         unity_instance: str | None,
@@ -940,14 +1098,11 @@ class PluginHub(WebSocketEndpoint):
         # Guarded dedicated mode: refuse a foreign target before any resolution/dispatch so a
         # sibling route can never be addressed through this server.
         guard = get_active_guard()
-        guarded = False
-        guarded_hash: str | None = None
-        if guard.enabled:
+        guarded = guard.enabled
+        if guarded:
             decision = guard.authorize_target(unity_instance)
             if not decision.allowed:
                 raise CrossTargetDispatchError(decision.reason)
-            guarded = True
-            guarded_hash = guard.resolve_bound_hash()
 
         # Bound waiting for Unity sessions. Default to 20s to handle domain reloads
         # (which can take 10-20s after test runs or script changes).
@@ -987,14 +1142,11 @@ class PluginHub(WebSocketEndpoint):
             # caller cannot reach a sibling route by omitting the target.
             if guarded:
                 sessions = await cls._registry.list_sessions(user_id=user_id)
-                session = None
-                if guarded_hash:
-                    if config.http_remote_hosted and user_id:
-                        session = await cls._registry.get_session_id_by_hash(
-                            guarded_hash, user_id)
-                    else:
-                        session = await cls._registry.get_session_id_by_hash(guarded_hash)
-                return session, len(sessions), explicit_required
+                selection = await cls.resolve_guarded_session(unity_instance, user_id=user_id)
+                if selection.status_code == 403:
+                    raise CrossTargetDispatchError(
+                        selection.error or "cross-target dispatch refused")
+                return selection.session_id, len(sessions), explicit_required
 
             # Prefer a specific Unity instance if one was requested
             if target_hash:

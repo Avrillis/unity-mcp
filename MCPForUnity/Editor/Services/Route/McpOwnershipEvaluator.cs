@@ -89,6 +89,12 @@ namespace MCPForUnity.Editor.Services.Route
 
         /// <summary>A live server owned by another editor lifetime. Never adopt, never overwrite.</summary>
         LiveForeign,
+
+        /// <summary>
+        /// The existing ownership file cannot be read, parsed or structurally trusted. It is
+        /// UNKNOWN, not stale and not absent: nothing may adopt, overwrite or delete it.
+        /// </summary>
+        Unknown,
     }
 
     /// <summary>
@@ -502,6 +508,8 @@ namespace MCPForUnity.Editor.Services.Route
             promoted = new McpRunStateRecord
             {
                 SchemaVersion = McpRunStateRecord.CurrentSchemaVersion,
+                // The lifecycle keeps its identity through a valid starting -> running transition.
+                RecordId = record.RecordId,
                 CanonicalProjectRoot = record.CanonicalProjectRoot,
                 Endpoint = record.Endpoint,
                 EditorPid = record.EditorPid,
@@ -537,8 +545,11 @@ namespace MCPForUnity.Editor.Services.Route
 
             if (!record.IsStructurallyValid(out string structuralError))
             {
-                detail = $"the existing record is unusable ({structuralError}); it may be replaced.";
-                return McpAdoptionOutcome.Stale;
+                // A record that cannot be trusted is UNKNOWN. Treating it as replaceable would let
+                // a half-written or foreign file be silently overwritten, so it blocks instead.
+                detail = $"the existing ownership record is unusable ({structuralError}); "
+                         + "it is treated as unknown and will not be adopted, replaced or deleted.";
+                return McpAdoptionOutcome.Unknown;
             }
 
             if (observation == null)

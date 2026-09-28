@@ -41,6 +41,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
 
         private readonly IToolDiscoveryService _toolDiscoveryService;
+        private readonly IMcpManagedConnectionAuthorizer _managedAuthorizer;
         private ClientWebSocket _socket;
         private CancellationTokenSource _lifecycleCts;
         private CancellationTokenSource _connectionCts;
@@ -63,8 +64,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private bool _disposed;
 
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
+            : this(toolDiscoveryService, null)
+        {
+        }
+
+        public WebSocketTransportClient(
+            IToolDiscoveryService toolDiscoveryService,
+            IMcpManagedConnectionAuthorizer managedAuthorizer)
         {
             _toolDiscoveryService = toolDiscoveryService;
+            _managedAuthorizer = managedAuthorizer ?? new McpRouteConnectionAuthorizer();
         }
 
         public bool IsConnected => _isConnected;
@@ -259,38 +268,32 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             Uri connectedEndpoint = null;
             Exception lastConnectError = null;
 
-            foreach (Uri candidate in BuildConnectionCandidateUris(originalEndpoint))
+            // Managed pre-connect gate. This runs BEFORE any socket is created or opened: a managed
+            // editor must never reach another editor's MCP endpoint, and a reachable endpoint is not
+            // proof of ownership. A refusal returns here without a network attempt.
+            McpConnectAttempt gated = await McpManagedPreConnectGate.ConnectWithGateAsync(
+                _managedAuthorizer,
+                async candidateToken =>
+                {
+                    CandidateOpenResult opened =
+                        await OpenCandidateSocketAsync(originalEndpoint, candidateToken)
+                            .ConfigureAwait(false);
+                    connectedEndpoint = opened.Endpoint;
+                    lastConnectError = opened.LastError;
+                    return opened.Opened;
+                },
+                message => McpLog.Error($"[WebSocket] {message}"),
+                connectionToken).ConfigureAwait(false);
+
+            if (!gated.Authorized)
             {
-                connectionToken.ThrowIfCancellationRequested();
-
-                _socket?.Dispose();
-                _socket = new ClientWebSocket();
-                _socket.Options.KeepAliveInterval = _socketKeepAliveInterval;
-
-                // Add API key header if configured (for remote-hosted mode)
-                if (!string.IsNullOrEmpty(_apiKey))
-                {
-                    _socket.Options.SetRequestHeader(AuthConstants.ApiKeyHeader, _apiKey);
-                }
-
-                try
-                {
-                    await _socket.ConnectAsync(candidate, connectionToken).ConfigureAwait(false);
-                    connectedEndpoint = candidate;
-                    break;
-                }
-                catch (OperationCanceledException) when (connectionToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    lastConnectError = ex;
-                    McpLog.Debug($"[WebSocket] Connect failed for {candidate}: {ex.Message}");
-                }
+                _state = TransportState.Disconnected(
+                    TransportDisplayName,
+                    gated.Reason ?? "Managed MCP connection refused: ownership was not proven.");
+                return false;
             }
 
-            if (connectedEndpoint == null)
+            if (!gated.Opened || connectedEndpoint == null)
             {
                 string errorMsg = "Connection failed. Check that the server URL is correct, the server is running, and your API key (if required) is valid.";
                 McpLog.Error($"[WebSocket] {errorMsg} (Detail: {lastConnectError?.Message ?? "Unknown error"})");
@@ -319,6 +322,58 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Opens one candidate endpoint. Extracted so the gated orchestration above can be exercised
+        /// without an Editor; the real implementation is only ever reached after the gate allowed it.
+        /// </summary>
+        private async Task<CandidateOpenResult> OpenCandidateSocketAsync(
+            Uri originalEndpoint,
+            CancellationToken connectionToken)
+        {
+            var result = new CandidateOpenResult();
+            foreach (Uri candidate in BuildConnectionCandidateUris(originalEndpoint))
+            {
+                connectionToken.ThrowIfCancellationRequested();
+
+                _socket?.Dispose();
+                _socket = new ClientWebSocket();
+                _socket.Options.KeepAliveInterval = _socketKeepAliveInterval;
+
+                // Add API key header if configured (for remote-hosted mode)
+                if (!string.IsNullOrEmpty(_apiKey))
+                {
+                    _socket.Options.SetRequestHeader(AuthConstants.ApiKeyHeader, _apiKey);
+                }
+
+                try
+                {
+                    await _socket.ConnectAsync(candidate, connectionToken).ConfigureAwait(false);
+                    result.Endpoint = candidate;
+                    break;
+                }
+                catch (OperationCanceledException) when (connectionToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    result.LastError = ex;
+                    McpLog.Debug($"[WebSocket] Connect failed for {candidate}: {ex.Message}");
+                }
+            }
+
+            result.Opened = result.Endpoint != null;
+            return result;
+        }
+
+        /// <summary>Outcome of one candidate-open attempt.</summary>
+        private sealed class CandidateOpenResult
+        {
+            public bool Opened;
+            public Uri Endpoint;
+            public Exception LastError;
         }
 
         /// <summary>

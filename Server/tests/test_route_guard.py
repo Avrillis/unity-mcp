@@ -269,6 +269,8 @@ class TestDispatchTargeting:
             canonical_root=None,
             instance_token="nonce-1",
         ).allowed
+        # The registration is only dispatchable once the hub has published the session entry.
+        guard.mark_bound()
         return guard
 
     def test_cross_target_dispatch_rejected(self, tmp_path):
@@ -321,6 +323,25 @@ class TestSingleRegistration:
         self, guard, tmp_path, *, connection_id, project_hash="hash1",
         instance_token="nonce-1", project_name="Game",
     ):
+        decision = guard.authorize_registration(
+            project_name=project_name,
+            project_hash=project_hash,
+            project_path=str(tmp_path),
+            canonical_root=None,
+            instance_token=instance_token,
+            connection_id=connection_id,
+        )
+        if decision.allowed:
+            # Mirrors the hub: a reserved binding becomes dispatchable once its registry entry
+            # has been published.
+            guard.mark_bound()
+        return decision
+
+    def _reserve_only(
+        self, guard, tmp_path, *, connection_id, project_hash="hash1",
+        instance_token="nonce-1", project_name="Game",
+    ):
+        """Authorise a registration WITHOUT publishing it (leaves the binding REGISTERING)."""
         return guard.authorize_registration(
             project_name=project_name,
             project_hash=project_hash,
@@ -329,6 +350,44 @@ class TestSingleRegistration:
             instance_token=instance_token,
             connection_id=connection_id,
         )
+
+    def test_registration_in_progress_refuses_a_second_registration(self, tmp_path):
+        """A reservation that has not been published must not be taken over."""
+        guard = build_guard(str(tmp_path), "nonce-1")
+        assert self._reserve_only(guard, tmp_path, connection_id="c1").allowed is True
+        assert guard.binding_state == ManagedRouteGuard.BINDING_REGISTERING
+
+        decision = self._reserve_only(guard, tmp_path, connection_id="c2")
+
+        assert decision.allowed is False
+        assert "in progress" in decision.reason
+        assert guard.bound_connection_id == "c1"
+
+    def test_reserved_binding_is_not_dispatchable_until_published(self, tmp_path):
+        guard = build_guard(str(tmp_path), "nonce-1")
+        assert self._reserve_only(guard, tmp_path, connection_id="c1").allowed is True
+
+        # While REGISTERING there is no dispatchable instance, so every target fails closed.
+        assert guard.resolve_bound_hash() is None
+        assert guard.has_bound_instance is False
+        assert guard.authorize_target(None).allowed is False
+        assert guard.authorize_target("hash1").allowed is False
+
+        guard.mark_bound()
+
+        assert guard.binding_state == ManagedRouteGuard.BINDING_BOUND
+        assert guard.resolve_bound_hash() == "hash1"
+        assert guard.authorize_target(None).allowed is True
+
+    def test_failed_registration_after_reservation_releases_the_binding(self, tmp_path):
+        guard = build_guard(str(tmp_path), "nonce-1")
+        assert self._reserve_only(guard, tmp_path, connection_id="c1").allowed is True
+
+        # A registration that fails after reserving must not leave the route unusable.
+        guard.release_binding()
+
+        assert guard.binding_state == ManagedRouteGuard.BINDING_UNBOUND
+        assert self._register_with(guard, tmp_path, connection_id="c2").allowed is True
 
     def test_first_valid_registration_binds_one_identity(self, tmp_path):
         guard = build_guard(str(tmp_path), "nonce-1")

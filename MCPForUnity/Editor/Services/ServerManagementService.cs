@@ -107,14 +107,20 @@ namespace MCPForUnity.Editor.Services
 
         private McpRunStateRecord ReadOwnershipRecord()
         {
-            _routeStateStore.TryRead(out McpRunStateRecord record, out string error);
-            if (record == null && !string.IsNullOrEmpty(error))
+            McpOwnershipSnapshot snapshot = ReadOwnershipSnapshot();
+            if (!snapshot.IsPresent && !string.IsNullOrEmpty(snapshot.Detail))
             {
-                McpLog.Debug($"[MCP Route] {error}");
+                McpLog.Debug($"[MCP Route] {snapshot.Detail}");
             }
 
-            return record;
+            return snapshot.IsPresent ? snapshot.Record : null;
         }
+
+        /// <summary>Fresh ownership state, distinguishing absent from unreadable/malformed.</summary>
+        private McpOwnershipSnapshot ReadOwnershipSnapshot() => _routeStateStore.ReadOwnershipState();
+
+        /// <summary>The cross-process critical section every ownership mutation runs inside.</summary>
+        private IMcpOwnershipLockProvider OwnershipLocks => _routeStateStore.OwnershipLocks;
 
         /// <summary>
         /// Gathers the live observations for one ownership decision. Anything that cannot
@@ -160,13 +166,53 @@ namespace MCPForUnity.Editor.Services
             McpOwnershipObservation observation = BuildOwnershipObservation(record, endpoint);
             observation.ServerPid = observation.PidFilePid;
 
-            return McpOwnershipEvaluator.TryIdentifyPendingServer(
-                record, observation, out promoted, out _);
+            if (!McpOwnershipEvaluator.TryIdentifyPendingServer(
+                    record, observation, out McpRunStateRecord candidate, out _))
+            {
+                return false;
+            }
+
+            // Promotion is conditional: it may only replace the exact pending publication that was
+            // identified. If a successor record appeared in the meantime it is left untouched.
+            McpRunStateRecord promotedLocal = candidate;
+            if (!McpOwnershipMutation.TryMutate(
+                    OwnershipLocks,
+                    current =>
+                    {
+                        if (!current.IsPresent)
+                        {
+                            return McpMutationDecision.Abort(
+                                current.IsUnknown
+                                    ? "the ownership record is unreadable; refusing to promote it."
+                                    : "the pending ownership record is gone; refusing to promote it.");
+                        }
+
+                        if (!McpOwnershipIdentity.IsSamePublication(record, current.Record))
+                        {
+                            return McpMutationDecision.Abort(
+                                "a different ownership record is now published; refusing to promote it.");
+                        }
+
+                        return McpMutationDecision.Write(promotedLocal);
+                    },
+                    out _))
+            {
+                return false;
+            }
+
+            promoted = promotedLocal;
+            return true;
         }
 
         /// <summary>
         /// Terminates the server described by <paramref name="record"/> only when every piece
         /// of live evidence agrees. Returns false (leaving the process untouched) otherwise.
+        ///
+        /// The final decision is taken inside the cross-process ownership critical section and is
+        /// conditioned on the ownership record still being the exact publication that was
+        /// evaluated, the listener still being the validated server and the retained process handle
+        /// still being that same lifetime. Deletion afterwards is conditional too, so a successor
+        /// lifecycle's record is never removed.
         /// </summary>
         private bool TryStopOwnedServer(McpRunStateRecord record, string endpoint, bool quiet)
         {
@@ -178,14 +224,18 @@ namespace MCPForUnity.Editor.Services
                 && string.Equals(record.LifecycleState, McpRunStateRecord.LifecycleStarting, StringComparison.Ordinal)
                 && TryPromotePendingRecord(record, endpoint, out McpRunStateRecord promoted))
             {
-                if (_routeStateStore.Write(promoted, out string promoteError))
+                // The promotion itself was conditional; re-read so the evaluation below sees the
+                // record that is actually published now.
+                McpRunStateRecord published = ReadOwnershipRecord();
+                if (published != null)
                 {
-                    record = promoted;
+                    record = published;
                     observation = BuildOwnershipObservation(record, endpoint);
                 }
                 else if (!quiet)
                 {
-                    McpLog.Warn($"[MCP Route] Could not complete the ownership record: {promoteError}");
+                    McpLog.Warn(
+                        "[MCP Route] Could not complete the ownership record; the launch stays pending.");
                 }
             }
 
@@ -227,18 +277,36 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            if (!_processTerminator.TerminateValidated(handle, validatedStart, out string terminateError))
+            int port = GetPortFromEndpoint(endpoint);
+            McpTerminationOutcome outcome = McpOwnershipMutation.TerminateIfStillOwned(
+                OwnershipLocks,
+                () => port > 0
+                    ? _processInspector.GetListeningProcessIds(port)
+                    : (IReadOnlyList<int>)Array.Empty<int>(),
+                record,
+                validatedStart,
+                handle,
+                (retained, start) => _processTerminator.TerminateValidated(retained, start, out string terminateError)
+                    ? null
+                    : terminateError);
+
+            if (!outcome.Terminated)
             {
                 if (!quiet)
                 {
-                    McpLog.Warn(
-                        $"[MCP Route] Refusing to stop server PID {record.ServerPid}: {terminateError} "
-                        + "The process was left untouched.");
+                    McpLog.Warn($"[MCP Route] Refusing to stop server PID {record.ServerPid}: "
+                                + $"{outcome.Reason} The process was left untouched.");
                 }
                 return false;
             }
 
-            _routeStateStore.DeleteRecord();
+            if (!outcome.RecordRemoved && !quiet)
+            {
+                McpLog.Warn(
+                    "[MCP Route] The server was stopped but the ownership record was left in place: "
+                    + outcome.Reason);
+            }
+
             McpLog.Info($"Stopped local HTTP server on {endpoint} (PID: {record.ServerPid})");
             return true;
         }
@@ -396,17 +464,31 @@ namespace MCPForUnity.Editor.Services
             }
 
             // ---- ownership gate: never adopt or overwrite a foreign live server ----
-            McpRunStateRecord existing = ReadOwnershipRecord();
+            McpOwnershipSnapshot existingState = ReadOwnershipSnapshot();
+            if (existingState.IsUnknown)
+            {
+                // An unreadable ownership record is UNKNOWN, not stale: overwriting it could destroy
+                // another editor's live ownership evidence.
+                McpLog.Error($"[MCP Route] {existingState.Detail}");
+                ReportStartFailure(
+                    quiet,
+                    "Ownership Unknown",
+                    existingState.Detail + "\n\nNo server was started. Resolve the existing "
+                    + "ownership record before launching a managed server.");
+                return false;
+            }
+
+            McpRunStateRecord existing = existingState.IsPresent ? existingState.Record : null;
             McpOwnershipObservation existingObservation = BuildOwnershipObservation(existing, endpoint);
             McpAdoptionOutcome adoption = McpOwnershipEvaluator.EvaluateAdoption(
                 existing, existingObservation, out string adoptionDetail);
 
-            if (adoption == McpAdoptionOutcome.LiveForeign)
+            if (adoption == McpAdoptionOutcome.LiveForeign || adoption == McpAdoptionOutcome.Unknown)
             {
                 McpLog.Error($"[MCP Route] {adoptionDetail}");
                 ReportStartFailure(
                     quiet,
-                    "Server Already Owned",
+                    adoption == McpAdoptionOutcome.Unknown ? "Ownership Unknown" : "Server Already Owned",
                     adoptionDetail + "\n\nNo server was started and the existing process was left untouched.");
                 return false;
             }
@@ -433,12 +515,6 @@ namespace MCPForUnity.Editor.Services
                         + "Stop the owning process manually or change the HTTP URL.");
                     return false;
                 }
-            }
-
-            // Any record that survived the gate is stale (not ours, no live server): replace it.
-            if (existing != null)
-            {
-                _routeStateStore.DeleteRecord();
             }
 
             // First-time-only confirmation. Subsequent launches (and the quiet auto-start path) skip the dialog.
@@ -492,6 +568,7 @@ namespace MCPForUnity.Editor.Services
                 var pendingRecord = new McpRunStateRecord
                 {
                     SchemaVersion = McpRunStateRecord.CurrentSchemaVersion,
+                    RecordId = McpRunStateRecord.NewRecordId(),
                     CanonicalProjectRoot = GetCanonicalProjectRoot(),
                     Endpoint = endpoint,
                     EditorPid = GetCurrentProcessIdSafe(),
@@ -506,7 +583,34 @@ namespace MCPForUnity.Editor.Services
                     WrittenUtc = McpRunStateRecord.FormatUtc(DateTime.UtcNow),
                 };
 
-                if (!_routeStateStore.Write(pendingRecord, out string recordError))
+                // Publication is a single conditional mutation: the adoption decision is re-taken
+                // against the CURRENT record while the cross-process lock is held, so a foreign or
+                // unreadable record that appeared since the gate above can never be overwritten.
+                if (!McpOwnershipMutation.TryMutate(
+                        OwnershipLocks,
+                        current =>
+                        {
+                            if (current.IsUnknown)
+                            {
+                                return McpMutationDecision.Abort(
+                                    "the existing ownership record is unreadable; refusing to "
+                                    + "overwrite it.");
+                            }
+
+                            McpAdoptionOutcome rechecked = McpOwnershipEvaluator.EvaluateAdoption(
+                                current.Record,
+                                BuildOwnershipObservation(current.Record, endpoint),
+                                out string detail);
+
+                            if (rechecked == McpAdoptionOutcome.LiveForeign
+                                || rechecked == McpAdoptionOutcome.Unknown)
+                            {
+                                return McpMutationDecision.Abort(detail);
+                            }
+
+                            return McpMutationDecision.Write(pendingRecord);
+                        },
+                        out string recordError))
                 {
                     McpLog.Error($"[MCP Route] {recordError}");
                     ReportStartFailure(
@@ -634,10 +738,10 @@ namespace MCPForUnity.Editor.Services
                 McpRunStateRecord record = ReadOwnershipRecord();
                 if (record != null
                     && string.Equals(record.LifecycleState, McpRunStateRecord.LifecycleStarting, StringComparison.Ordinal)
-                    && TryPromotePendingRecord(record, endpoint, out McpRunStateRecord promoted)
-                    && _routeStateStore.Write(promoted, out _))
+                    && TryPromotePendingRecord(record, endpoint, out _))
                 {
-                    record = promoted;
+                    // The promotion (if any) was applied conditionally; observe what is published now.
+                    record = ReadOwnershipRecord() ?? record;
                 }
 
                 // "Running" now means one thing only: this editor lifetime provably owns the
@@ -884,9 +988,8 @@ namespace MCPForUnity.Editor.Services
                     DateTime deadline = DateTime.UtcNow.AddSeconds(20);
                     while (DateTime.UtcNow < deadline)
                     {
-                        if (TryPromotePendingRecord(pendingRecord, endpoint, out McpRunStateRecord promoted))
+                        if (TryPromotePendingRecord(pendingRecord, endpoint, out _))
                         {
-                            _routeStateStore.Write(promoted, out _);
                             return;
                         }
 

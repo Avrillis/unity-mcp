@@ -153,6 +153,18 @@ namespace MCPForUnity.RouteIsolation.Tests
         [TestCase("http://10.0.0.5:8123")]
         [TestCase("")]
         [TestCase("http://127.0.0.1:0")]
+        // Blocker 6: a managed URL must carry an explicit port. Uri.Port silently reports the
+        // scheme default (80) for these, which must not be allowed to describe a real endpoint.
+        [TestCase("http://127.0.0.1")]
+        [TestCase("http://localhost")]
+        [TestCase("http://[::1]")]
+        [TestCase("http://127.0.0.1/")]
+        // Blocker 6: bind-all and remote hosts are never valid for a managed route.
+        [TestCase("http://0.0.0.0:8123")]
+        [TestCase("http://[::]:8123")]
+        [TestCase("http://192.168.1.5:8123")]
+        // Blocker 6: the managed server is plain HTTP.
+        [TestCase("https://127.0.0.1:8123")]
         public void F_InvalidHttpUrlOverride_FailsClosed(string value)
         {
             McpRouteInputs inputs = Stored();
@@ -180,7 +192,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void F_BindAllUrl_RequiresTheExistingLanOptIn()
+        public void F_BindAllUrl_IsRefusedForAManagedRouteEvenWithTheLegacyLanOptIn()
         {
             McpRouteInputs inputs = Stored(allowLanBind: false);
             inputs.TransportEnvironmentValue = "http";
@@ -188,10 +200,19 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             Assert.That(McpRouteConfiguration.Resolve(inputs).IsValid, Is.False);
 
+            // The legacy LAN opt-in must not be able to widen a managed process-scoped route.
             inputs.StoredAllowLanBind = true;
-            McpRouteConfiguration allowed = McpRouteConfiguration.Resolve(inputs);
-            Assert.That(allowed.IsValid, Is.True);
-            Assert.That(allowed.LocalHttpBaseUrl, Is.EqualTo("http://0.0.0.0:8123"));
+            McpRouteConfiguration stillRefused = McpRouteConfiguration.Resolve(inputs);
+            Assert.That(stillRefused.IsValid, Is.False);
+            Assert.That(stillRefused.LocalHttpBaseUrl, Is.Empty);
+
+            // The legacy validator itself is unchanged: it is what a stored (unmanaged) value
+            // still goes through, and it alone honours the opt-in.
+            Assert.That(
+                McpRouteConfiguration.TryValidateLocalHttpUrl(
+                    "http://0.0.0.0:8123", allowLanBind: true, out string legacy, out _),
+                Is.True);
+            Assert.That(legacy, Is.EqualTo("http://0.0.0.0:8123"));
         }
 
         // ------------------------------------------------------------------ G

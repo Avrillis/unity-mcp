@@ -26,6 +26,19 @@ namespace MCPForUnity.Editor.Services.Route
         /// </summary>
         bool TryRead(out McpRunStateRecord record, out string error);
 
+        /// <summary>
+        /// Reads the current ownership state, distinguishing "no record" from "a record I could
+        /// not read or parse". Malformed/unreadable state is UNKNOWN and must block every
+        /// adoption, replacement, promotion and deletion.
+        /// </summary>
+        McpOwnershipSnapshot ReadOwnershipState();
+
+        /// <summary>
+        /// Cross-process critical section used by every conditional ownership mutation for this
+        /// project's RunState directory.
+        /// </summary>
+        IMcpOwnershipLockProvider OwnershipLocks { get; }
+
         /// <summary>Atomically writes the ownership record.</summary>
         bool Write(McpRunStateRecord record, out string error);
 
