@@ -111,32 +111,8 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
-            string directory = GetRunStateDirectory();
-            try
-            {
-                Directory.CreateDirectory(directory);
-            }
-            catch (Exception ex)
-            {
-                error = $"the RunState directory '{directory}' could not be created: {ex.Message}";
-                return false;
-            }
-
             string json = record.ToJson();
-            string tempPath = path + ".tmp";
-
-            try
-            {
-                File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-                ReplaceAtomically(tempPath, path);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                error = $"the ownership record could not be written to '{path}': {ex.Message}";
-                TryDelete(tempPath);
-                return false;
-            }
+            return McpRunStateFile.TryWriteAtomic(path, json, out error);
         }
 
         /// <inheritdoc/>
@@ -189,7 +165,6 @@ namespace MCPForUnity.Editor.Services.Route
             if (!string.IsNullOrEmpty(path))
             {
                 TryDelete(path);
-                TryDelete(path + ".tmp");
             }
         }
 
@@ -202,29 +177,6 @@ namespace MCPForUnity.Editor.Services.Route
 
             string runState = GetRunStateDirectory();
             return !string.IsNullOrEmpty(runState) && McpRunStatePaths.IsPathInside(candidate, runState);
-        }
-
-        /// <summary>
-        /// Replaces the destination with the freshly written temp file. File.Replace is
-        /// atomic on NTFS; where it is unsupported we fall back to a delete + move, which is
-        /// still safe here because only this editor writes its own record.
-        /// </summary>
-        private static void ReplaceAtomically(string tempPath, string destinationPath)
-        {
-            if (File.Exists(destinationPath))
-            {
-                try
-                {
-                    File.Replace(tempPath, destinationPath, destinationBackupFileName: null);
-                    return;
-                }
-                catch (Exception)
-                {
-                    File.Delete(destinationPath);
-                }
-            }
-
-            File.Move(tempPath, destinationPath);
         }
 
         private static void TryDelete(string path)

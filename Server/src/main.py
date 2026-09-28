@@ -10,7 +10,12 @@ from core.telemetry import record_milestone, record_telemetry, MilestoneType, Re
 from services.resources import register_all_resources
 from transport.plugin_registry import PluginRegistry
 from transport.plugin_hub import PluginHub
-from transport.route_guard import build_guard, get_active_guard, set_active_guard
+from transport.route_guard import (
+    apply_guarded_binding_environment,
+    build_guard,
+    get_active_guard,
+    set_active_guard,
+)
 from services.custom_tool_service import (
     CustomToolService,
     resolve_project_id_for_unity_instance,
@@ -427,10 +432,24 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
 
                 # Dedicated route guard: this server serves exactly one Unity instance, so
                 # refuse any target that is not it (before looking anything up).
-                guard_decision = get_active_guard().authorize_target(unity_instance)
+                active_guard = get_active_guard()
+                guard_decision = active_guard.authorize_target(unity_instance)
                 if not guard_decision.allowed:
                     return JSONResponse(
                         {"success": False, "error": guard_decision.reason}, status_code=403
+                    )
+
+                # A guarded server has no "first available session": without a binding there is
+                # nothing it is allowed to dispatch to, and a binding is the only thing it may
+                # ever dispatch to.
+                bound_hash = active_guard.resolve_bound_hash() if active_guard.enabled else None
+                if active_guard.enabled and not bound_hash:
+                    return JSONResponse(
+                        {
+                            "success": False,
+                            "error": "No Unity instance is registered with this dedicated MCP server yet.",
+                        },
+                        status_code=503,
                     )
 
                 # Get available sessions
@@ -467,6 +486,22 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
 
                 # If no specific unity_instance requested, use first available session
                 # (Must be done before execute_custom_tool check so all command types benefit)
+                if not session_id and bound_hash:
+                    for sid, details in sessions.sessions.items():
+                        if details.hash == bound_hash:
+                            session_id = sid
+                            session_details = details
+                            break
+
+                    if not session_id:
+                        return JSONResponse(
+                            {
+                                "success": False,
+                                "error": "The dedicated Unity instance is not connected.",
+                            },
+                            status_code=503,
+                        )
+
                 if not session_id:
                     try:
                         session_id = next(iter(sessions.sessions.keys()))
@@ -836,7 +871,17 @@ Examples:
         "UNITY_MCP_TRANSPORT", "stdio")
     logger.info(f"Transport mode: {config.transport_mode}")
 
-    config.http_remote_hosted = (
+    # A dedicated (guarded) server is local-only: it serves exactly one editor on this machine.
+    guarded_mode = args.unity_project_root is not None
+    if guarded_mode and (
+        args.http_remote_hosted
+        or os.environ.get("UNITY_MCP_HTTP_REMOTE_HOSTED", "").lower() in ("true", "1", "yes", "on")
+    ):
+        logger.warning(
+            "Guarded dedicated mode ignores the remote-hosted flag: a dedicated server is "
+            "local-only"
+        )
+    config.http_remote_hosted = not guarded_mode and (
         bool(args.http_remote_hosted)
         or os.environ.get("UNITY_MCP_HTTP_REMOTE_HOSTED", "").lower() in ("true", "1", "yes", "on")
     )
@@ -879,24 +924,23 @@ Examples:
         )
         raise SystemExit(1)
 
-    http_url = os.environ.get("UNITY_MCP_HTTP_URL", args.http_url)
-    parsed_url = urlparse(http_url)
-
-    # Allow individual host/port to override URL components
-    http_host = args.http_host or os.environ.get(
-        "UNITY_MCP_HTTP_HOST") or parsed_url.hostname or "127.0.0.1"
-
-    # Safely parse optional environment port (may be None or non-numeric)
-    _env_port_str = os.environ.get("UNITY_MCP_HTTP_PORT")
-    try:
-        _env_port = int(_env_port_str) if _env_port_str is not None else None
-    except ValueError:
+    # Resolve the HTTP binding. In guarded (dedicated) mode the endpoint passed on the command
+    # line wins and inherited routing variables are removed, so an inherited value can never
+    # redirect this server away from the endpoint its editor owns.
+    http_url, http_host, http_port, ignored_routing_env = apply_guarded_binding_environment(
+        os.environ,
+        guarded_mode,
+        args.http_url,
+        args.http_host,
+        args.http_port,
+    )
+    if ignored_routing_env:
         logger.warning(
-            "Invalid UNITY_MCP_HTTP_PORT value '%s', ignoring", _env_port_str)
-        _env_port = None
+            "Guarded dedicated mode ignores inherited server routing environment variable(s): %s",
+            ", ".join(ignored_routing_env),
+        )
 
-    http_port = args.http_port or _env_port or parsed_url.port or 8080
-
+    os.environ["UNITY_MCP_HTTP_URL"] = http_url
     os.environ["UNITY_MCP_HTTP_HOST"] = http_host
     os.environ["UNITY_MCP_HTTP_PORT"] = str(http_port)
 
@@ -965,12 +1009,12 @@ Examples:
     if config.transport_mode == 'http':
         # Use HTTP transport for FastMCP
         transport = 'http'
-        # Use the parsed host and port from URL/args
+        # Reuse the binding already resolved (and, for a dedicated server, sanitized) above.
         http_url = os.environ.get("UNITY_MCP_HTTP_URL", args.http_url)
         parsed_url = urlparse(http_url)
         host = args.http_host or os.environ.get(
             "UNITY_MCP_HTTP_HOST") or parsed_url.hostname or "127.0.0.1"
-        port = args.http_port or _env_port or parsed_url.port or 8080
+        port = int(os.environ.get("UNITY_MCP_HTTP_PORT") or 0) or parsed_url.port or 8080
         logger.info(f"Starting FastMCP with HTTP transport on {host}:{port}")
         mcp.run(transport=transport, host=host, port=port)
     else:

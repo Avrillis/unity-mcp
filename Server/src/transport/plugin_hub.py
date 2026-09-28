@@ -223,6 +223,12 @@ class PluginHub(WebSocketEndpoint):
             websocket.state.api_key_metadata = result.metadata
 
         await websocket.accept()
+        # Stable per-connection identity used to bind a dedicated server to exactly one Unity
+        # connection (and to refuse a second concurrent registration).
+        try:
+            websocket.state.connection_id = uuid.uuid4().hex
+        except Exception:  # pragma: no cover - state is always writable on Starlette
+            pass
         msg = WelcomeMessage(
             serverTimeout=self.SERVER_TIMEOUT,
             keepAliveInterval=self.KEEP_ALIVE_INTERVAL,
@@ -297,11 +303,25 @@ class PluginHub(WebSocketEndpoint):
         only prevents a stale binding from authorizing a later dispatch.
         """
         guard = get_active_guard()
-        if not guard.enabled or not guard.bound_project_hash or cls._registry is None:
+        if not guard.enabled or not guard.has_bound_instance or cls._registry is None:
             return
 
         if not await cls._registry.get_session_id_by_hash(guard.bound_project_hash):
             guard.release_binding()
+
+    @staticmethod
+    def _connection_identity(websocket: Any) -> str:
+        """Stable identity for one plugin WebSocket connection.
+
+        Used by the guarded dedicated mode to bind exactly one Unity connection. The value is
+        per-connection, not per-project, so a second connection that copies the same project
+        root and launch nonce cannot replace a live binding.
+        """
+        state = getattr(websocket, "state", None)
+        connection_id = getattr(state, "connection_id", None)
+        if isinstance(connection_id, str) and connection_id:
+            return connection_id
+        return f"ws-{id(websocket):x}"
 
     # ------------------------------------------------------------------
     # Public API
@@ -470,14 +490,19 @@ class PluginHub(WebSocketEndpoint):
 
         # Dedicated-server route guard: bind this server to exactly one Unity project and
         # reject any foreign registration (wrong project or wrong/missing launch nonce).
+        # A binding left behind by a connection that is already gone is released first, so a
+        # genuine reconnect of the same guarded identity can re-bind; a binding whose session is
+        # still live is never released here, so a second connection cannot take it over.
         guard = get_active_guard()
         if guard.enabled:
+            await cls._release_guard_binding_if_orphaned()
             decision = guard.authorize_registration(
                 project_name=project_name,
                 project_hash=project_hash,
                 project_path=project_path,
                 canonical_root=payload.canonical_project_root,
                 instance_token=payload.instance_token,
+                connection_id=cls._connection_identity(websocket),
             )
             if not decision.allowed:
                 logger.warning(
@@ -915,10 +940,14 @@ class PluginHub(WebSocketEndpoint):
         # Guarded dedicated mode: refuse a foreign target before any resolution/dispatch so a
         # sibling route can never be addressed through this server.
         guard = get_active_guard()
+        guarded = False
+        guarded_hash: str | None = None
         if guard.enabled:
             decision = guard.authorize_target(unity_instance)
             if not decision.allowed:
                 raise CrossTargetDispatchError(decision.reason)
+            guarded = True
+            guarded_hash = guard.resolve_bound_hash()
 
         # Bound waiting for Unity sessions. Default to 20s to handle domain reloads
         # (which can take 10-20s after test runs or script changes).
@@ -952,6 +981,21 @@ class PluginHub(WebSocketEndpoint):
 
         async def _try_once() -> tuple[str | None, int, bool]:
             explicit_required = config.http_remote_hosted
+
+            # Guarded dedicated mode: the ONLY valid target is the bound instance. Ordinary
+            # first-session / active / default selection must never be reachable here, so a
+            # caller cannot reach a sibling route by omitting the target.
+            if guarded:
+                sessions = await cls._registry.list_sessions(user_id=user_id)
+                session = None
+                if guarded_hash:
+                    if config.http_remote_hosted and user_id:
+                        session = await cls._registry.get_session_id_by_hash(
+                            guarded_hash, user_id)
+                    else:
+                        session = await cls._registry.get_session_id_by_hash(guarded_hash)
+                return session, len(sessions), explicit_required
+
             # Prefer a specific Unity instance if one was requested
             if target_hash:
                 # In remote-hosted mode with user_id, use user-scoped lookup
@@ -986,7 +1030,8 @@ class PluginHub(WebSocketEndpoint):
                 return []
 
         session_id, session_count, explicit_required = await _try_once()
-        if session_id is None and explicit_required and not target_hash and session_count > 0:
+        if (session_id is None and explicit_required and not guarded
+                and not target_hash and session_count > 0):
             raise InstanceSelectionRequiredError(
                 available_instances=await _available_instance_ids())
         deadline = time.monotonic() + max_wait_s
@@ -995,11 +1040,12 @@ class PluginHub(WebSocketEndpoint):
         # If there is no active plugin yet (e.g., Unity starting up or reloading),
         # wait politely for a session to appear before surfacing an error.
         while session_id is None and time.monotonic() < deadline:
-            if not target_hash and session_count > 1:
+            if not guarded and not target_hash and session_count > 1:
                 raise InstanceSelectionRequiredError(
                     InstanceSelectionRequiredError._MULTIPLE_INSTANCES,
                     available_instances=await _available_instance_ids())
-            if session_id is None and explicit_required and not target_hash and session_count > 0:
+            if (session_id is None and explicit_required and not guarded
+                    and not target_hash and session_count > 0):
                 raise InstanceSelectionRequiredError(
                     available_instances=await _available_instance_ids())
             if wait_started is None:
@@ -1018,11 +1064,12 @@ class PluginHub(WebSocketEndpoint):
                 time.monotonic() - wait_started,
                 unity_instance or "default",
             )
-        if session_id is None and not target_hash and session_count > 1:
+        if session_id is None and not guarded and not target_hash and session_count > 1:
             raise InstanceSelectionRequiredError(
                 InstanceSelectionRequiredError._MULTIPLE_INSTANCES)
 
-        if session_id is None and explicit_required and not target_hash and session_count > 0:
+        if (session_id is None and explicit_required and not guarded
+                and not target_hash and session_count > 0):
             raise InstanceSelectionRequiredError()
 
         if session_id is None:

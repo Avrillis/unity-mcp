@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Route;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -212,8 +213,18 @@ namespace MCPForUnity.Editor.Helpers
         /// <returns>Package source string for uvx --from argument</returns>
         public static string GetMcpServerPackageSource()
         {
+            // A managed (supervisor-launched) route must run the Python server that is paired with
+            // the installed package revision, because the project-root/nonce guard lives in that
+            // exact tree. There is deliberately no PyPI fallback and no global override here: an
+            // unresolvable provenance yields an empty source, which callers treat as fail-closed.
+            if (McpRouteProvider.Configuration.IsManagedRoute)
+            {
+                McpServerSourceResolution resolution = McpServerSourceProvider.ResolveManaged();
+                return resolution.IsResolved ? resolution.Source : string.Empty;
+            }
+
             // Check for override first (supports git URLs, file:// paths, local paths)
-            string sourceOverride = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
+            string sourceOverride = GetEffectiveGitUrlOverride();
             if (!string.IsNullOrEmpty(sourceOverride))
             {
                 string resolved = ResolveLocalServerPath(sourceOverride);
@@ -221,7 +232,10 @@ namespace MCPForUnity.Editor.Helpers
                 if (resolved != sourceOverride)
                 {
                     EditorPrefs.SetString(EditorPrefKeys.GitUrlOverride, resolved);
-                    McpLog.Info($"Auto-corrected server source override from '{sourceOverride}' to '{resolved}'");
+                    // Never echo the configured value: it may embed credentials.
+                    McpLog.Info(
+                        $"Auto-corrected the server source override ({EditorPrefKeys.GitUrlOverride}) "
+                        + "to point at the directory containing pyproject.toml.");
                 }
                 return resolved;
             }
@@ -242,6 +256,22 @@ namespace MCPForUnity.Editor.Helpers
             }
 
             return $"mcpforunityserver=={version}";
+        }
+
+        /// <summary>
+        /// The global "Server source override" to honour, or empty for a managed route.
+        ///
+        /// A managed route must run the server paired with the installed package, so the global
+        /// override is ignored there (the managed launch path refuses it outright).
+        /// </summary>
+        private static string GetEffectiveGitUrlOverride()
+        {
+            if (McpRouteProvider.Configuration.IsManagedRoute)
+            {
+                return string.Empty;
+            }
+
+            return EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
         }
 
         /// <summary>
@@ -329,7 +359,7 @@ namespace MCPForUnity.Editor.Helpers
         /// <returns>The package source arguments (e.g., "--prerelease explicit --from mcpforunityserver>=0.0.0a0")</returns>
         public static string GetBetaServerFromArgs(bool quoteFromPath = false)
         {
-            string gitUrlOverride = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
+            string gitUrlOverride = GetEffectiveGitUrlOverride();
             string packageSource = GetMcpServerPackageSource();
             return GetBetaServerFromArgs(gitUrlOverride, packageSource, quoteFromPath);
         }
@@ -343,6 +373,13 @@ namespace MCPForUnity.Editor.Helpers
         /// <param name="quoteFromPath">Whether to quote the --from path</param>
         public static string GetBetaServerFromArgs(string gitUrlOverride, string packageSource, bool quoteFromPath = false)
         {
+            // Managed route with an underivable paired source: emit an explicitly empty --from so
+            // the command fails closed instead of resolving the PyPI default package.
+            if (McpRouteProvider.Configuration.IsManagedRoute && string.IsNullOrEmpty(packageSource))
+            {
+                return quoteFromPath ? "--from \"\"" : "--from ";
+            }
+
             // Explicit override (local path, git URL, etc.) always wins
             if (!string.IsNullOrEmpty(gitUrlOverride))
             {
@@ -380,7 +417,7 @@ namespace MCPForUnity.Editor.Helpers
         /// <returns>List of arguments to add to uvx command</returns>
         public static System.Collections.Generic.IList<string> GetBetaServerFromArgsList()
         {
-            string gitUrlOverride = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
+            string gitUrlOverride = GetEffectiveGitUrlOverride();
             string packageSource = GetMcpServerPackageSource();
             return GetBetaServerFromArgsList(gitUrlOverride, packageSource);
         }
@@ -394,6 +431,15 @@ namespace MCPForUnity.Editor.Helpers
         public static System.Collections.Generic.IList<string> GetBetaServerFromArgsList(string gitUrlOverride, string packageSource)
         {
             var args = new System.Collections.Generic.List<string>();
+
+            // A managed route whose paired server source could not be derived must not fall
+            // through to the PyPI default: emit an explicitly empty --from so uvx fails closed.
+            if (McpRouteProvider.Configuration.IsManagedRoute && string.IsNullOrEmpty(packageSource))
+            {
+                args.Add("--from");
+                args.Add(string.Empty);
+                return args;
+            }
 
             // Explicit override (local path, git URL, etc.) always wins
             if (!string.IsNullOrEmpty(gitUrlOverride))

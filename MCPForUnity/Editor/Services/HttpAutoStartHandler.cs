@@ -185,6 +185,24 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
+        /// True when this editor may connect to the local endpoint.
+        ///
+        /// For a legacy (unmanaged) route the reachability probe is enough. For a managed route
+        /// the endpoint must be provably owned by THIS editor lifetime - the same project-local
+        /// ownership evaluation the stop path uses - so auto-start can never attach to a sibling
+        /// worker's server or to a stale listener left on the port.
+        /// </summary>
+        private static bool IsOwnedManagedEndpoint(MCPForUnity.Editor.Services.IServerManagementService server)
+        {
+            if (!McpRouteProvider.Configuration.IsManagedRoute)
+            {
+                return true;
+            }
+
+            return server.IsLocalHttpServerRunning();
+        }
+
+        /// <summary>
         /// Returns false when services were not ready yet (caller retries). On true the
         /// pending reconnect was either dispatched or deliberately dropped (auto-start
         /// disabled, transport switched, bridge already running).
@@ -313,7 +331,7 @@ namespace MCPForUnity.Editor.Services
                 if (!EditorConfigurationCache.Instance.UseHttpTransport) return;
                 if (MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http)) return;
 
-                if (server.IsLocalHttpServerReachable())
+                if (server.IsLocalHttpServerReachable() && IsOwnedManagedEndpoint(server))
                 {
                     McpLog.Info($"Server ready on {url}");
                     bool started = await MCPServiceLocator.Bridge.StartAsync();
@@ -332,8 +350,10 @@ namespace MCPForUnity.Editor.Services
 
                 if (launchProcessDied || elapsed > hardCap.TotalSeconds)
                 {
-                    // Last-resort connect attempt in case reachability detection missed a live server.
-                    if (await MCPServiceLocator.Bridge.StartAsync())
+                    // Last-resort connect attempt in case reachability detection missed a live
+                    // server. Still gated on ownership for a managed route: a reachable port is
+                    // not proof that the server on it belongs to this editor.
+                    if (IsOwnedManagedEndpoint(server) && await MCPServiceLocator.Bridge.StartAsync())
                     {
                         McpLog.Info("Session connected");
                         MCPForUnityEditorWindow.RequestHealthVerification();

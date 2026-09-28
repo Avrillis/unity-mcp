@@ -23,6 +23,17 @@
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRouteConfigurationCache.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRunStateRecord.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpOwnershipEvaluator.cs" />
+    <!-- Production adapters whose Unity-facing shells are thin enough to test here. -->
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRunStateFile.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpRouteObservationBuilder.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedConnectionGate.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpTerminationIdentity.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerSourceResolver.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerEnvironmentSanitizer.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpClientRoute.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedServerArguments.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/IMcpRouteStateStore.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/IMcpProcessInspector.cs" />
   </ItemGroup>
 
   <ItemGroup>

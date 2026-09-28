@@ -107,11 +107,23 @@ namespace MCPForUnity.Editor.Services.Route
 
         public int ServerPid;
         public bool ServerProcessExists;
+        /// <summary>
+        /// True only when the server process existence check completed and its answer is
+        /// trustworthy. A failed query leaves this false so the evaluator refuses instead of
+        /// treating "could not look" as "not running".
+        /// </summary>
+        public bool ServerProcessExistenceKnown;
         public bool ServerProcessLifetimeAvailable;
         public DateTime? ServerProcessStartUtc;
 
         public bool ServerCommandLineAvailable;
         public string ServerCommandLine;
+
+        /// <summary>
+        /// Whether the editor process named by the record is still running. Used only to decide
+        /// whether another editor lifetime's record is an orphan that may be replaced.
+        /// </summary>
+        public bool? RecordedEditorProcessExists;
 
         public string PidFilePath;
         public bool PidFileExists;
@@ -130,13 +142,6 @@ namespace MCPForUnity.Editor.Services.Route
     /// </summary>
     public static class McpOwnershipEvaluator
     {
-        /// <summary>
-        /// Slack when comparing process creation times. Windows reports these with
-        /// sub-second precision but they round-trip through JSON and different OS APIs,
-        /// so exact equality would produce false refusals.
-        /// </summary>
-        public static readonly TimeSpan StartTimeTolerance = TimeSpan.FromSeconds(2);
-
         /// <summary>
         /// Evaluates whether <paramref name="observation"/> is the exact server described by
         /// <paramref name="record"/>.
@@ -208,7 +213,7 @@ namespace MCPForUnity.Editor.Services.Route
                     "the editor process start time is unavailable on one side of the comparison.");
             }
 
-            if (!WithinTolerance(recordedEditorStart, observation.CurrentEditorStartUtc.Value))
+            if (!SameProcessInstant(recordedEditorStart, observation.CurrentEditorStartUtc.Value))
             {
                 return McpOwnershipDecision.Deny(
                     McpOwnershipDenyReason.ForeignEditorLifetime,
@@ -237,6 +242,15 @@ namespace MCPForUnity.Editor.Services.Route
                     $"observed server PID {observation.ServerPid} is not the recorded {record.ServerPid}.");
             }
 
+            if (!observation.ServerProcessExistenceKnown)
+            {
+                // The existence query itself failed. Absence of evidence is not evidence of
+                // absence: refuse rather than act on an unobservable process.
+                return McpOwnershipDecision.Deny(
+                    McpOwnershipDenyReason.MissingProcessLifetime,
+                    "the server process existence check did not complete.");
+            }
+
             if (!observation.ServerProcessExists)
             {
                 return McpOwnershipDecision.Deny(
@@ -260,7 +274,7 @@ namespace MCPForUnity.Editor.Services.Route
                     "the server process start time could not be corroborated.");
             }
 
-            if (!WithinTolerance(recordedServerStart, observation.ServerProcessStartUtc.Value))
+            if (!SameProcessInstant(recordedServerStart, observation.ServerProcessStartUtc.Value))
             {
                 return McpOwnershipDecision.Deny(
                     McpOwnershipDenyReason.PidReuse,
@@ -408,7 +422,7 @@ namespace MCPForUnity.Editor.Services.Route
 
             if (!observation.CurrentEditorStartUtc.HasValue
                 || !McpRunStateRecord.TryParseUtc(record.EditorStartUtc, out DateTime recordedEditorStart)
-                || !WithinTolerance(recordedEditorStart, observation.CurrentEditorStartUtc.Value))
+                || !SameProcessInstant(recordedEditorStart, observation.CurrentEditorStartUtc.Value))
             {
                 detail = "the pending record belongs to a different editor lifetime.";
                 return false;
@@ -464,7 +478,7 @@ namespace MCPForUnity.Editor.Services.Route
             }
 
             DateTime serverStart = observation.ServerProcessStartUtc.Value;
-            if (serverStart < writtenUtc - StartTimeTolerance)
+            if (serverStart < writtenUtc)
             {
                 detail = "the process predates the launch record (PID reuse).";
                 return false;
@@ -540,14 +554,36 @@ namespace MCPForUnity.Editor.Services.Route
                 return McpAdoptionOutcome.OwnedByCurrentLifetime;
             }
 
+            // The record may still be this editor's own incomplete launch (for example a launch
+            // interrupted by a domain reload). That record is ours to complete or replace; only a
+            // record from a *different* editor lifetime is ever treated as foreign.
+            if (IsCurrentEditorLifetime(record, observation))
+            {
+                detail = "the record was written by this editor lifetime; it may be reused or replaced.";
+                return McpAdoptionOutcome.OwnedByCurrentLifetime;
+            }
+
             // The record is not ours. It is only replaceable when its server is provably gone
             // and its editor lifetime is over; a live server is never adopted.
-            bool serverGone = !observation.ServerProcessExists
-                              || !Contains(observation.ListeningProcessIds, record.ServerPid);
-
-            if (serverGone)
+            // A pending record is never replaceable on the strength of a missing listener or a
+            // not-yet-written pidfile: "still starting" and "gone" are indistinguishable there.
+            if (string.Equals(record.LifecycleState, McpRunStateRecord.LifecycleStarting, StringComparison.Ordinal))
             {
-                detail = $"the recorded server is no longer live ({ownership.Reason}); the record may be replaced.";
+                detail = "the existing record belongs to another editor lifetime and is still pending "
+                         + "(or not yet observable); refusing to adopt or overwrite it.";
+                return McpAdoptionOutcome.LiveForeign;
+            }
+
+            // Only positively established staleness may be replaced: the recorded server must be
+            // confirmed gone AND the editor that wrote the record must be confirmed gone too.
+            bool serverConfirmedGone = observation.ServerProcessExistenceKnown
+                                       && !observation.ServerProcessExists;
+            bool editorConfirmedGone = observation.RecordedEditorProcessExists.HasValue
+                                       && !observation.RecordedEditorProcessExists.Value;
+
+            if (serverConfirmedGone && editorConfirmedGone && !Contains(observation.ListeningProcessIds, record.ServerPid))
+            {
+                detail = $"the recorded server and its editor are both gone ({ownership.Reason}); the record may be replaced.";
                 return McpAdoptionOutcome.Stale;
             }
 
@@ -556,11 +592,57 @@ namespace MCPForUnity.Editor.Services.Route
             return McpAdoptionOutcome.LiveForeign;
         }
 
-        private static bool WithinTolerance(DateTime left, DateTime right)
+        /// <summary>
+        /// True when the record names this exact editor process lifetime (PID and creation
+        /// instant). An unavailable instant is treated as "not proven ours".
+        /// </summary>
+        public static bool IsCurrentEditorLifetime(
+            McpRunStateRecord record,
+            McpOwnershipObservation observation)
         {
-            double deltaSeconds = Math.Abs((left - right).TotalSeconds);
-            return deltaSeconds <= StartTimeTolerance.TotalSeconds;
+            if (record == null || observation == null)
+            {
+                return false;
+            }
+
+            if (record.EditorPid <= 0 || record.EditorPid != observation.CurrentEditorPid)
+            {
+                return false;
+            }
+
+            // A record copied from another project can carry the same editor PID; it is only
+            // "ours" when it also names this project AND this endpoint.
+            if (!McpRunStatePaths.PathsEqual(
+                    record.CanonicalProjectRoot, observation.CanonicalProjectRoot))
+            {
+                return false;
+            }
+
+            if (!string.Equals(
+                    NormalizeEndpoint(record.Endpoint),
+                    NormalizeEndpoint(observation.Endpoint),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return observation.CurrentEditorStartUtc.HasValue
+                   && McpRunStateRecord.TryParseUtc(record.EditorStartUtc, out DateTime recordedEditorStart)
+                   && SameProcessInstant(recordedEditorStart, observation.CurrentEditorStartUtc.Value);
         }
+
+        /// <summary>
+        /// Exact process-creation comparison. Both sides are read from the same OS process
+        /// identity source and round-tripped through the invariant "O" format, so no tolerance
+        /// is required (or justified): any difference means a different process lifetime.
+        /// </summary>
+        public static bool SameProcessInstant(DateTime left, DateTime right)
+        {
+            return ToUtc(left).Ticks == ToUtc(right).Ticks;
+        }
+
+        private static DateTime ToUtc(DateTime value)
+            => value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime();
 
         private static bool Contains(IReadOnlyList<int> values, int pid)
         {

@@ -44,14 +44,15 @@ namespace MCPForUnity.Editor.Services.Server
             // approved implementation: the project-root/nonce guard lives in it. A global
             // `--from` server-source override would swap the implementation out from under the
             // guard, so a managed route refuses it instead of degrading silently.
+            bool managedRoute = McpRouteProvider.Configuration.IsManagedRoute;
             string sourceOverride = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, string.Empty);
             if (!McpRouteConfiguration.IsServerSourceOverrideAllowed(
-                    McpRouteProvider.Configuration.IsManagedRoute, sourceOverride))
+                    managedRoute, sourceOverride))
             {
                 error =
                     "This editor's MCP endpoint was supplied by its launching process, so it must "
                     + "use the approved MCP server build. Clear the \"Server source override\" "
-                    + $"advanced setting (currently '{sourceOverride}') to start the managed server.";
+                    + "advanced setting to start the managed server.";
                 return false;
             }
 
@@ -83,7 +84,28 @@ namespace MCPForUnity.Editor.Services.Server
             string scopedFlag = projectScopedTools ? " --project-scoped-tools" : string.Empty;
 
             // Use centralized helper for beta server / prerelease args
-            string fromArgs = AssetPathUtility.GetBetaServerFromArgs(quoteFromPath: true);
+            string fromArgs;
+            if (managedRoute)
+            {
+                // The server must be the SAME revision as the installed package: equal version
+                // strings say nothing about the Python implementation, and the project-root/nonce
+                // guard only exists in the paired fork revision. Never PyPI, never an override.
+                McpServerSourceResolution resolution = McpServerSourceProvider.ResolveManaged();
+                if (!resolution.IsResolved)
+                {
+                    error =
+                        "[MCP Route] The compatible MCP server source could not be derived from the "
+                        + $"installed package ({resolution.Category}); refusing to launch this managed "
+                        + $"route rather than falling back to a different server build. {resolution.Error}";
+                    return false;
+                }
+
+                fromArgs = $"--from \"{resolution.Source}\"";
+            }
+            else
+            {
+                fromArgs = AssetPathUtility.GetBetaServerFromArgs(quoteFromPath: true);
+            }
 
             string args = string.IsNullOrEmpty(fromArgs)
                 ? $"{devFlags}{packageName} --transport http --http-url {httpUrl}{projectRootFlag}{scopedFlag}"

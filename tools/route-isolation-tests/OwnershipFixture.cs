@@ -82,6 +82,7 @@ namespace MCPForUnity.RouteIsolation.Tests
                 CurrentEditorStartUtc = EditorStart,
                 ServerPid = ServerPid,
                 ServerProcessExists = true,
+                ServerProcessExistenceKnown = true,
                 ServerProcessLifetimeAvailable = true,
                 ServerProcessStartUtc = ServerStart,
                 ServerCommandLineAvailable = true,
@@ -93,6 +94,7 @@ namespace MCPForUnity.RouteIsolation.Tests
                 PidFileExists = true,
                 PidFileReadable = true,
                 PidFilePid = ServerPid,
+                RecordedEditorProcessExists = true,
                 ListeningProcessIds = new List<int> { ServerPid },
             };
         }

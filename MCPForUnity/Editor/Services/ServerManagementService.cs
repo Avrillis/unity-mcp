@@ -63,11 +63,6 @@ namespace MCPForUnity.Editor.Services
             _processInspector = processInspector ?? new McpProcessInspector(_processDetector);
         }
 
-        private string QuoteIfNeeded(string s)
-        {
-            return _commandBuilder.QuoteIfNeeded(s);
-        }
-
         // ------------------------------------------------------------------
         // Managed-route ownership
         //
@@ -129,53 +124,17 @@ namespace MCPForUnity.Editor.Services
             McpRunStateRecord record,
             string endpoint)
         {
-            var observation = new McpOwnershipObservation
-            {
-                CanonicalProjectRoot = GetCanonicalProjectRoot(),
-                RunStateDirectory = _routeStateStore.GetRunStateDirectory(),
-                Endpoint = endpoint,
-                CurrentEditorPid = GetCurrentProcessIdSafe(),
-                PidFilePath = GetLocalHttpServerPidFilePath(GetPortFromEndpoint(endpoint)),
-            };
-
-            if (_processInspector.TryGetCurrentProcessStartTimeUtc(out DateTime editorStart))
-            {
-                observation.CurrentEditorStartUtc = editorStart;
-            }
-
-            if (!string.IsNullOrEmpty(observation.PidFilePath))
-            {
-                observation.PidFileReadable =
-                    _routeStateStore.TryReadPidFile(observation.PidFilePath, out int pidFromFile, out bool exists);
-                observation.PidFileExists = exists;
-                observation.PidFilePid = observation.PidFileReadable ? pidFromFile : 0;
-            }
-
-            int serverPid = record != null && record.ServerPid > 0
-                ? record.ServerPid
-                : observation.PidFilePid;
-            observation.ServerPid = serverPid;
-
-            if (serverPid > 0)
-            {
-                observation.ServerProcessExists = _processInspector.ProcessExists(serverPid);
-                if (_processInspector.TryGetProcessStartTimeUtc(serverPid, out DateTime serverStart))
+            return McpRouteObservationBuilder.Build(
+                _routeStateStore,
+                _processInspector,
+                new McpObservationRequest
                 {
-                    observation.ServerProcessLifetimeAvailable = true;
-                    observation.ServerProcessStartUtc = serverStart;
-                }
-
-                observation.ServerCommandLineAvailable =
-                    _processInspector.TryGetCommandLine(serverPid, out string commandLine);
-                observation.ServerCommandLine = observation.ServerCommandLineAvailable ? commandLine : null;
-            }
-
-            int port = GetPortFromEndpoint(endpoint);
-            observation.ListeningProcessIds = port > 0
-                ? _processInspector.GetListeningProcessIds(port)
-                : new List<int>();
-
-            return observation;
+                    CanonicalProjectRoot = GetCanonicalProjectRoot(),
+                    Endpoint = endpoint,
+                    CurrentEditorPid = GetCurrentProcessIdSafe(),
+                    RecordedServerPid = record != null && record.ServerPid > 0 ? record.ServerPid : 0,
+                    RecordedEditorPid = record != null && record.EditorPid > 0 ? record.EditorPid : 0,
+                });
         }
 
         /// <summary>
@@ -242,11 +201,39 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            if (!TerminateProcess(record.ServerPid))
+            // The evaluation validated one specific process lifetime. Retain exactly that
+            // lifetime and terminate through it: the PID alone is never used again, so a process
+            // that exits here and whose PID is reused cannot be killed by mistake.
+            if (!McpRunStateRecord.TryParseUtc(record.ServerStartUtc, out DateTime validatedStart))
             {
                 if (!quiet)
                 {
-                    McpLog.Warn($"[MCP Route] Failed to terminate owned server PID {record.ServerPid}.");
+                    McpLog.Warn(
+                        "[MCP Route] Refusing to stop a local HTTP server: the validated record has "
+                        + "no usable server creation time.");
+                }
+                return false;
+            }
+
+            if (!_processInspector.TryOpenRetainedProcess(record.ServerPid, out IRetainedProcessHandle handle))
+            {
+                if (!quiet)
+                {
+                    McpLog.Warn(
+                        $"[MCP Route] Refusing to stop server PID {record.ServerPid}: the validated "
+                        + "process lifetime could not be retained, so it cannot be killed safely. "
+                        + "The process was left untouched.");
+                }
+                return false;
+            }
+
+            if (!_processTerminator.TerminateValidated(handle, validatedStart, out string terminateError))
+            {
+                if (!quiet)
+                {
+                    McpLog.Warn(
+                        $"[MCP Route] Refusing to stop server PID {record.ServerPid}: {terminateError} "
+                        + "The process was left untouched.");
                 }
                 return false;
             }
@@ -472,8 +459,19 @@ namespace MCPForUnity.Editor.Services
 
             string launchLog = GetLocalHttpServerLaunchLogPath(port);
             string instanceToken = Guid.NewGuid().ToString("N");
-            string launchCommand =
-                $"{displayCommand} --pidfile {QuoteIfNeeded(pidFilePath)} --unity-instance-token {instanceToken}";
+            if (!McpManagedServerArguments.TryAppendLaunchIdentity(
+                    displayCommand,
+                    pidFilePath,
+                    instanceToken,
+                    out string launchCommand,
+                    out string launchCommandError))
+            {
+                ReportStartFailure(
+                    quiet,
+                    "Cannot Start HTTP Server",
+                    launchCommandError ?? "The managed launch command could not be constructed.");
+                return false;
+            }
 
             try
             {
@@ -535,6 +533,18 @@ namespace MCPForUnity.Editor.Services
                 // Launch the server headless (no terminal window); stdout+stderr go to the launch log.
                 string effectiveLog = launchLog ?? Path.Combine(Path.GetTempPath(), "mcp-for-unity-server-launch.log");
                 var startInfo = CreateHeadlessProcessStartInfo(launchCommand, effectiveLog);
+
+                // The approved endpoint is supplied on the command line. An inherited
+                // server-side routing variable would let the child pick a different endpoint, so
+                // it is removed from the environment before the process is created.
+                IReadOnlyList<string> strippedRouting =
+                    McpServerEnvironmentSanitizer.RemoveRoutingVariables(startInfo.EnvironmentVariables);
+                if (strippedRouting.Count > 0)
+                {
+                    McpLog.Warn(
+                        "[MCP Route] Ignored inherited server routing environment variable(s) for "
+                        + $"this managed launch: {string.Join(", ", strippedRouting)}.");
+                }
 
                 // The headless shell is not a login shell, so it does not inherit the user's
                 // profile PATH (on macOS, GUI-launched Unity has a minimal PATH). Prepend the
@@ -836,11 +846,6 @@ namespace MCPForUnity.Editor.Services
         private int GetCurrentProcessIdSafe()
         {
             return _processDetector.GetCurrentProcessId();
-        }
-
-        private bool TerminateProcess(int pid)
-        {
-            return _processTerminator.Terminate(pid);
         }
 
         /// <summary>

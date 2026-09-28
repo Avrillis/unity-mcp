@@ -299,6 +299,9 @@ namespace MCPForUnity.RouteIsolation.Tests
             newLifetime.CurrentEditorPid = OwnershipFixture.DefaultEditorPid + 1000;
             newLifetime.CurrentEditorStartUtc = fixture.EditorStart.AddDays(1);
             newLifetime.ServerProcessExists = false;
+            // Staleness has to be positively established on BOTH sides: the recorded server is
+            // gone AND the editor lifetime that wrote the record is gone too.
+            newLifetime.RecordedEditorProcessExists = false;
             newLifetime.ListeningProcessIds = new List<int>();
 
             McpAdoptionOutcome outcome = McpOwnershipEvaluator.EvaluateAdoption(

@@ -10,10 +10,12 @@ namespace MCPForUnity.Editor.Services.Route
     /// <summary>
     /// Resolves and holds the process-scoped MCP route for this Unity Editor.
     ///
-    /// Resolution happens exactly once per editor process (the cached value lives in a
-    /// static, and statics are preserved across domain reloads in the same process). That is
-    /// what makes the route stable: a later domain reload or an EditorPrefs/UI change cannot
-    /// redirect an editor whose route was supplied through the process environment.
+    /// Resolution happens at most once per domain lifetime. Static fields do NOT survive a Unity
+    /// domain reload, so the stable part is the process ENVIRONMENT itself: the same unchanged
+    /// <c>UNITY_MCP_*</c> variables deterministically re-resolve to the same managed route after
+    /// a reload, independent of any later EditorPrefs edit. Where state must outlive a reload
+    /// (the launch nonce), the project-local ownership record is the carrier - and it is only
+    /// honoured while it still names this exact editor process lifetime and route.
     /// </summary>
     public static class McpRouteProvider
     {
@@ -97,6 +99,11 @@ namespace MCPForUnity.Editor.Services.Route
         private static McpRouteStateStore GetOrCreateDefaultStore()
             => _defaultStateStore ??= new McpRouteStateStore();
 
+        private static McpProcessInspector _processInspector;
+
+        private static McpProcessInspector GetOrCreateProcessInspector()
+            => _processInspector ??= new McpProcessInspector();
+
         /// <summary>
         /// The endpoint this editor uses, or an empty string when the configuration is
         /// invalid (so launch, connect and stop paths all fail closed).
@@ -128,34 +135,79 @@ namespace MCPForUnity.Editor.Services.Route
         /// </summary>
         public static bool TryGetActiveLaunchToken(out string instanceToken)
         {
+            return TryGetActiveLaunchToken(out instanceToken, out _, out _);
+        }
+
+        /// <summary>
+        /// Returns the launch nonce only when the whole ownership tuple is coherent for the
+        /// CURRENT editor lifetime and the live server.
+        ///
+        /// A reachable endpoint is not proof of ownership, so the nonce is never released on the
+        /// strength of a copied, stale or foreign record: schema, project root, endpoint, editor
+        /// PID and creation instant, lifecycle, nonce shape, RunState path and the live server
+        /// identity must all agree. Anything else fails closed.
+        /// </summary>
+        public static bool TryGetActiveLaunchToken(
+            out string instanceToken,
+            out McpOwnershipDenyReason reason,
+            out string detail)
+        {
             instanceToken = null;
+            reason = McpOwnershipDenyReason.None;
+            detail = null;
 
             try
             {
-                if (!GetOrCreateDefaultStore().TryRead(out McpRunStateRecord record, out _)
-                    || record == null
-                    || string.IsNullOrWhiteSpace(record.InstanceToken))
+                McpRouteConfiguration route = Configuration;
+                if (!route.IsValid)
                 {
+                    reason = McpOwnershipDenyReason.MalformedRecord;
+                    detail = "the process-scoped MCP configuration for this editor was rejected.";
+                    McpLog.Debug($"[MCP Route] Not echoing a launch nonce: {detail}");
                     return false;
                 }
 
-                if (!McpRunStatePaths.PathsEqual(record.CanonicalProjectRoot, GetCanonicalProjectRoot()))
+                McpRouteStateStore store = GetOrCreateDefaultStore();
+                if (!store.TryRead(out McpRunStateRecord record, out string readError) || record == null)
                 {
+                    reason = McpOwnershipDenyReason.NoRecord;
+                    detail = readError;
+                    McpLog.Debug($"[MCP Route] Not echoing a launch nonce: {detail}");
                     return false;
                 }
 
-                if (record.EditorPid > 0 && record.EditorPid != new McpProcessInspector().GetCurrentProcessId())
+                McpProcessInspector inspector = GetOrCreateProcessInspector();
+                McpOwnershipObservation observation = McpRouteObservationBuilder.Build(
+                    store,
+                    inspector,
+                    new McpObservationRequest
+                    {
+                        CanonicalProjectRoot = GetCanonicalProjectRoot(),
+                        Endpoint = route.LocalHttpBaseUrl,
+                        CurrentEditorPid = inspector.GetCurrentProcessId(),
+                        RecordedServerPid = record.ServerPid,
+                        RecordedEditorPid = record.EditorPid,
+                    });
+
+                if (!McpManagedConnectionGate.TryGetLaunchToken(
+                        record,
+                        observation,
+                        out instanceToken,
+                        out reason,
+                        out detail))
                 {
-                    // A record left behind by a previous editor process is not ours to echo.
+                    McpLog.Debug(
+                        $"[MCP Route] Not echoing a launch nonce ({reason}): {detail}");
                     return false;
                 }
 
-                instanceToken = record.InstanceToken;
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
                 instanceToken = null;
+                reason = McpOwnershipDenyReason.MalformedRecord;
+                detail = ex.Message;
                 return false;
             }
         }

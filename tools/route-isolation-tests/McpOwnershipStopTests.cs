@@ -204,16 +204,27 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void T_SmallClockSkewBetweenObservations_IsTolerated()
+        public void T_ProcessStartComparisonsAreExact_NoToleranceIsApplied()
         {
             var fixture = new OwnershipFixture();
-            McpOwnershipObservation observation = fixture.BuildObservation();
-            observation.ServerProcessStartUtc = fixture.ServerStart.AddMilliseconds(500);
-            observation.CurrentEditorStartUtc = fixture.EditorStart.AddMilliseconds(-400);
 
+            // A single millisecond is a different process lifetime. Both sides are read from the
+            // same OS identity source and round-trip through the invariant "O" format, so there is
+            // no rounding error to absorb and no tolerance is justified.
+            McpOwnershipObservation serverShifted = fixture.BuildObservation();
+            serverShifted.ServerProcessStartUtc = fixture.ServerStart.AddMilliseconds(1);
             Assert.That(
-                McpOwnershipEvaluator.EvaluateStop(fixture.BuildRecord(), observation).Allowed,
-                Is.True);
+                McpOwnershipEvaluator.EvaluateStop(fixture.BuildRecord(), serverShifted).Allowed,
+                Is.False);
+
+            McpOwnershipObservation editorShifted = fixture.BuildObservation();
+            editorShifted.CurrentEditorStartUtc = fixture.EditorStart.AddMilliseconds(-1);
+            Assert.That(
+                McpOwnershipEvaluator.EvaluateStop(fixture.BuildRecord(), editorShifted).Allowed,
+                Is.False);
+
+            // The unchanged, coherent pair is still accepted.
+            Assert.That(fixture.EvaluateStop().Allowed, Is.True);
         }
 
         // ------------------------------------------------------------------ U

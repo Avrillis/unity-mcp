@@ -3,12 +3,16 @@ using System;
 namespace MCPForUnity.Editor.Services.Route
 {
     /// <summary>
-    /// Resolves the process-scoped MCP configuration exactly once and then reuses it for the
-    /// lifetime of the editor process.
+    /// Resolves the process-scoped MCP configuration once per domain lifetime and reuses it for
+    /// the rest of that lifetime.
     ///
-    /// The resolved value is deliberately not invalidatable. A domain reload (which preserves
-    /// statics) or a later EditorPrefs/UI change must not be able to redirect an editor whose
-    /// route was supplied through its process environment.
+    /// The resolved value is deliberately not invalidatable: within a domain, a later
+    /// EditorPrefs/UI change must not be able to redirect an editor whose route was supplied
+    /// through its process environment.
+    ///
+    /// This cache does NOT survive a domain reload (statics don't). After a reload the same
+    /// unchanged process environment re-resolves to the same route deterministically, which is
+    /// the actual guarantee - not static persistence.
     /// </summary>
     public sealed class McpRouteConfigurationCache
     {

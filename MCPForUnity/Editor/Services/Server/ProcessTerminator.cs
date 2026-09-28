@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Route;
 using UnityEngine;
 
 namespace MCPForUnity.Editor.Services.Server
@@ -23,6 +24,27 @@ namespace MCPForUnity.Editor.Services.Server
 
         /// <inheritdoc/>
         public bool Terminate(int pid)
+        {
+            return TerminateByPid(pid);
+        }
+
+        /// <inheritdoc/>
+        public bool TerminateValidated(
+            IRetainedProcessHandle handle,
+            DateTime validatedStartUtc,
+            out string error)
+        {
+            // The retained handle's creation instant must still be the one the ownership
+            // evaluation validated. This is the final check before the kill; a mismatch means
+            // the validated process is gone and whatever holds the PID now must not be killed.
+            return McpTerminationIdentity.TryTerminate(validatedStartUtc, handle, out error);
+        }
+
+        /// <summary>
+        /// Legacy PID-only termination. Retained for callers that predate the managed route; the
+        /// managed lifecycle path never uses it because a bare PID cannot be re-verified.
+        /// </summary>
+        private bool TerminateByPid(int pid)
         {
             // CRITICAL: Validate PID before any kill operation.
             // On Unix, kill(-1) kills ALL processes the user can signal!

@@ -243,10 +243,12 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
-            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
-                && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            // A managed route is served by the plain-HTTP local server this editor launches, so
+            // only http:// is accepted here. https:// would silently describe an endpoint that is
+            // not the one being launched.
+            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
             {
-                error = $"unsupported scheme '{uri.Scheme}'.";
+                error = $"managed routes must use http:// (received scheme '{uri.Scheme}').";
                 return false;
             }
 

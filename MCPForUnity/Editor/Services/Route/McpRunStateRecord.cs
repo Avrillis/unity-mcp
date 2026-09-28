@@ -287,6 +287,15 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
+            // A published record must always carry the instant it was written. The write time is
+            // the only thing that anchors a pending (not-yet-observable) server to a launch, so a
+            // record without it can never be treated as a usable ownership record.
+            if (!TryParseUtc(WrittenUtc, out _))
+            {
+                error = "written_utc is missing or malformed.";
+                return false;
+            }
+
             if (string.IsNullOrWhiteSpace(PidFilePath))
             {
                 error = "pidfile_path is missing.";

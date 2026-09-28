@@ -23,6 +23,22 @@ The fixtures exercise the dependency-free sources under
 Cases `A`–`Z` of the C17-R3 specification are covered here; the names of the test methods
 start with the letter they satisfy.
 
+`McpProductionAdapterTests.cs` additionally exercises the production adapters named by
+C17-R3-FIX1, using the same compiled production sources with only their Unity shells
+substituted:
+
+| Adapter | Behaviour under test |
+| --- | --- |
+| `McpRunStateFile` | unique-temp atomic publication, replacement, failure preserves the old record, concurrent writers, abandoned-temp reclamation |
+| `McpOwnershipEvaluator` (adoption) | pending/unknown ownership is never overwritten; only positively established staleness is replaceable |
+| `McpManagedConnectionGate` | the launch nonce is released only for coherent current ownership |
+| `McpTerminationIdentity` | retained-identity termination; PID reuse / exit / unreadable lifetime never kill |
+| `McpServerSourceResolver` + `McpPackageLockProvenance` | package and server share repository + full commit + `Server/`; no PyPI, no floating ref, no credentials |
+| `McpServerEnvironmentSanitizer` | inherited `UNITY_MCP_HTTP_*` routing variables are removed before launch |
+| `McpClientRoute` | generated client configuration follows the resolved process route |
+| `McpManagedServerArguments` | guarded launch argument construction (pidfile + nonce) and fail-closed tokens |
+| `McpRouteObservationBuilder` | the live observation used by the gate and the stop path |
+
 ## Companion checks
 
 * `tools/compile-check-dotnet.ps1` compiles the whole `MCPForUnity` Runtime + Editor assembly

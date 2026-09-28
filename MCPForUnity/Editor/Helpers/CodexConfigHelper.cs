@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Route;
 using MCPForUnity.External.Tommy;
 using UnityEditor;
 using UnityEngine;
@@ -24,6 +25,19 @@ namespace MCPForUnity.Editor.Helpers
                 args.Add(new TomlString { Value = flag });
         }
 
+        /// <summary>
+        /// Transport for a generated Codex config, resolved from the SINGLE effective route.
+        ///
+        /// Reading EditorPrefs directly here would let a global preference change rewrite the
+        /// client onto a different worker's endpoint, so the resolved process route wins.
+        /// </summary>
+        private static bool UseHttpTransport()
+        {
+            return McpClientRoute.UseHttp(
+                McpRouteProvider.Configuration,
+                EditorPrefs.GetBool(EditorPrefKeys.UseHttpTransport, true));
+        }
+
         public static string BuildCodexServerBlock(string uvPath)
         {
             var table = new TomlTable();
@@ -31,7 +45,7 @@ namespace MCPForUnity.Editor.Helpers
             var unityMCP = new TomlTable();
 
             // Check transport preference
-            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+            bool useHttpTransport = UseHttpTransport();
 
             if (useHttpTransport)
             {
@@ -88,7 +102,7 @@ namespace MCPForUnity.Editor.Helpers
             // Parse existing TOML or create new root table
             var root = TryParseToml(existingToml) ?? new TomlTable();
 
-            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+            bool useHttpTransport = UseHttpTransport();
 
             // Ensure mcp_servers table exists
             if (!root.TryGetNode("mcp_servers", out var mcpServersNode) || !(mcpServersNode is TomlTable))
@@ -186,7 +200,7 @@ namespace MCPForUnity.Editor.Helpers
             var unityMCP = new TomlTable();
 
             // Check transport preference
-            bool useHttpTransport = EditorPrefs.GetBool(MCPForUnity.Editor.Constants.EditorPrefKeys.UseHttpTransport, true);
+            bool useHttpTransport = UseHttpTransport();
 
             if (useHttpTransport)
             {
