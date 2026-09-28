@@ -713,8 +713,9 @@ namespace MCPForUnity.RouteIsolation.Tests
     }
 
     /// <summary>
-    /// Blocker 5: the managed host allowlist is exactly localhost / 127.0.0.1 / ::1. The legacy
-    /// unmanaged validator keeps its wider loopback behaviour.
+    /// Blocker 5: the managed host allowlist is the exact textual localhost / 127.0.0.1 / [::1].
+    /// The legacy unmanaged validator keeps its wider loopback behaviour. (C17-R3-FIX4 tightened
+    /// this from "any form that canonicalizes to 127.0.0.1" to the exact raw spelling.)
     /// </summary>
     [TestFixture]
     public class McpFix3ManagedHostTests
@@ -723,10 +724,6 @@ namespace MCPForUnity.RouteIsolation.Tests
         [TestCase("http://127.0.0.1:8081")]
         [TestCase("http://[::1]:8081")]
         [TestCase("http://LOCALHOST:8081")]
-        // Host spellings that canonicalize to 127.0.0.1 are deliberately accepted.
-        [TestCase("http://127.1:8081")]
-        [TestCase("http://0177.0.0.1:8081")]
-        [TestCase("http://2130706433:8081")]
         public void ManagedUrl_ApprovedHostsAreAccepted(string url)
         {
             Assert.That(
@@ -736,6 +733,11 @@ namespace MCPForUnity.RouteIsolation.Tests
             Assert.That(normalized, Is.Not.Null.And.Not.Empty);
         }
 
+        // Spellings that merely canonicalize to 127.0.0.1 are refused: the managed contract is
+        // the exact raw authority text, not whatever the platform parser normalizes it to.
+        [TestCase("http://127.1:8081")]
+        [TestCase("http://0177.0.0.1:8081")]
+        [TestCase("http://2130706433:8081")]
         [TestCase("http://127.0.0.2:8081")]
         [TestCase("http://127.1.2.3:8081")]
         [TestCase("http://127.255.255.254:8081")]
@@ -748,6 +750,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         [TestCase("http://localhost.example.com:8081")]
         [TestCase("http://localhost")]
         [TestCase("http://127.0.0.1")]
+        [TestCase("http://[::1]")]
         [TestCase("https://127.0.0.1:8081")]
         public void ManagedUrl_EverythingElseIsRefused(string url)
         {
@@ -762,13 +765,19 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void ManagedHostCheck_IsExact()
         {
-            Assert.That(McpRouteConfiguration.IsManagedLoopbackHost("127.0.0.1"), Is.True);
-            Assert.That(McpRouteConfiguration.IsManagedLoopbackHost("localhost"), Is.True);
-            Assert.That(McpRouteConfiguration.IsManagedLoopbackHost("[::1]"), Is.True);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("127.0.0.1"), Is.True);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("localhost"), Is.True);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("LOCALHOST"), Is.True);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("[::1]"), Is.True);
 
-            Assert.That(McpRouteConfiguration.IsManagedLoopbackHost("127.0.0.2"), Is.False);
-            Assert.That(McpRouteConfiguration.IsManagedLoopbackHost("127.0.0.1 "), Is.True,
-                "surrounding whitespace is normalized, not treated as a different host");
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("127.0.0.2"), Is.False);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("127.1"), Is.False);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("0177.0.0.1"), Is.False);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("2130706433"), Is.False);
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("::1"), Is.False,
+                "the managed IPv6 spelling is the bracketed authority, not the bare address");
+            Assert.That(McpRouteConfiguration.IsManagedRawHost("localhost "), Is.False,
+                "the allowlist compares the extracted host text, so stray whitespace is not a host");
         }
 
         [Test]

@@ -303,9 +303,11 @@ namespace MCPForUnity.Editor.Services.Route
         ///   * the URL text must carry an explicit TCP port - <see cref="Uri.Port"/> reports the
         ///     scheme default (80 for http) when no port was written, so a portless URL would
         ///     otherwise masquerade as a concrete endpoint;
-        ///   * the host must be exactly one of <c>localhost</c>, <c>127.0.0.1</c> or <c>::1</c>.
-        ///     The legacy LAN/bind-all opt-in does not apply, and the wider 127/8 loopback range is
-        ///     refused because two workers on one machine could otherwise name each other's port.
+        ///   * the raw authority host must be exactly <c>localhost</c>, <c>127.0.0.1</c> or
+        ///     <c>[::1]</c>, matched as written before any URI canonicalization. The legacy
+        ///     LAN/bind-all opt-in does not apply, the wider 127/8 loopback range is refused
+        ///     because two workers on one machine could otherwise name each other's port, and
+        ///     alternate spellings that merely canonicalize to an approved address are refused too.
         /// </summary>
         public static bool TryValidateManagedHttpUrl(
             string value,
@@ -322,12 +324,22 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
-            // The managed allowlist is deliberately narrower than the legacy loopback check: the
-            // whole 127/8 range is NOT a managed endpoint. Only the three approved spellings (and
-            // host forms that canonicalize to them, e.g. 127.1 -> 127.0.0.1) are accepted, so a
-            // sibling worker's chosen loopback address can never be described as this route.
-            if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out Uri managedUri)
-                || !IsManagedLoopbackHost(managedUri.Host))
+            // The managed authority is read from the raw URL text, never from Uri.Host: the
+            // platform URI parser canonicalizes legacy IPv4 spellings (127.1, 0177.0.0.1,
+            // 2130706433) to 127.0.0.1, so Uri.Host would let a differently-spelled endpoint be
+            // described as an approved one. The raw text is the only place the exact spelling
+            // still exists.
+            if (!TryExtractManagedAuthority(value, out string rawHost, out _))
+            {
+                error = "managed routes must be a bare http:// authority (no userinfo) such as "
+                        + "http://127.0.0.1:8081.";
+                return false;
+            }
+
+            // Exact textual allowlist. This is deliberately narrower than the legacy loopback
+            // check: the whole 127/8 range is NOT a managed endpoint, and neither is any alternate
+            // spelling that merely canonicalizes to an approved address.
+            if (!IsManagedRawHost(rawHost))
             {
                 error = "managed routes must target exactly localhost, 127.0.0.1 or [::1]; "
                         + "other loopback addresses are not an approved managed endpoint.";
@@ -351,36 +363,97 @@ namespace MCPForUnity.Editor.Services.Route
         }
 
         /// <summary>
-        /// True only for the exact hosts a MANAGED (process-scoped) route may name:
-        /// <c>localhost</c>, <c>127.0.0.1</c> and <c>::1</c>.
+        /// True only for the exact textual hosts a MANAGED (process-scoped) route may name:
+        /// <c>localhost</c> (case-insensitive), the literal <c>127.0.0.1</c> and the bracketed
+        /// IPv6 authority <c>[::1]</c>.
         ///
         /// This is intentionally stricter than <see cref="IsLoopbackHost"/>: the legacy helper
         /// accepts the whole IPv4 loopback range (127/8), which would let a managed route silently
-        /// describe an endpoint belonging to a sibling worker on the same machine. Host forms that
-        /// canonicalize to an approved address (for example <c>127.1</c> or the expanded IPv6
-        /// spelling of <c>::1</c>) are accepted, because they name the identical address.
+        /// describe an endpoint belonging to a sibling worker on the same machine. Alternate
+        /// spellings that the platform parser canonicalizes to an approved address (for example
+        /// <c>127.1</c>, <c>0177.0.0.1</c>, <c>2130706433</c> or an expanded IPv6 form) are
+        /// refused: they are a parsing ambiguity, not an approved managed endpoint.
         /// </summary>
-        public static bool IsManagedLoopbackHost(string host)
+        public static bool IsManagedRawHost(string rawHost)
         {
-            if (string.IsNullOrWhiteSpace(host))
+            if (string.IsNullOrEmpty(rawHost))
             {
                 return false;
             }
 
-            string normalized = host.Trim();
-            if (normalized.Length >= 2 && normalized[0] == '[' && normalized[normalized.Length - 1] == ']')
-            {
-                normalized = normalized.Substring(1, normalized.Length - 2);
-            }
-
-            if (string.Equals(normalized, "localhost", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(rawHost, "localhost", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
 
-            return System.Net.IPAddress.TryParse(normalized, out System.Net.IPAddress parsed)
-                   && (parsed.Equals(System.Net.IPAddress.Loopback)
-                       || parsed.Equals(System.Net.IPAddress.IPv6Loopback));
+            return rawHost == "127.0.0.1" || rawHost == "[::1]";
+        }
+
+        /// <summary>
+        /// Extracts the raw authority host text and the explicitly written TCP port from MANAGED
+        /// URL text without letting the platform URI parser canonicalize the host.
+        ///
+        /// Returns false, with no partial result, for anything that cannot be an approved managed
+        /// endpoint: a non-http scheme, an empty authority, userinfo, a missing/empty/non-numeric
+        /// port, a port outside the TCP range, a malformed bracketed authority, or an unbracketed
+        /// colon-bearing host such as <c>::1</c>.
+        /// </summary>
+        public static bool TryExtractManagedAuthority(
+            string rawUrl,
+            out string rawHost,
+            out int explicitPort)
+        {
+            rawHost = null;
+            explicitPort = 0;
+
+            if (!TrySplitRawAuthorityText(rawUrl, out string scheme, out string authority)
+                || !string.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || authority.IndexOf('@') >= 0)
+            {
+                return false;
+            }
+
+            string hostText;
+            string portText;
+            if (authority[0] == '[')
+            {
+                int close = authority.IndexOf(']');
+                if (close < 0)
+                {
+                    return false;
+                }
+
+                // Keep the brackets: the approved managed spelling is the bracketed authority.
+                hostText = authority.Substring(0, close + 1);
+                string remainder = authority.Substring(close + 1);
+                if (remainder.Length == 0 || remainder[0] != ':')
+                {
+                    return false;
+                }
+
+                portText = remainder.Substring(1);
+            }
+            else
+            {
+                int colon = authority.LastIndexOf(':');
+                if (colon < 0)
+                {
+                    return false;
+                }
+
+                hostText = authority.Substring(0, colon);
+                portText = authority.Substring(colon + 1);
+            }
+
+            if (hostText.Length == 0
+                || (hostText.IndexOf(':') >= 0 && hostText[0] != '[')
+                || !TryParsePortText(portText, out explicitPort))
+            {
+                return false;
+            }
+
+            rawHost = hostText;
+            return true;
         }
 
         /// <summary>
@@ -391,30 +464,13 @@ namespace MCPForUnity.Editor.Services.Route
         public static bool TryGetExplicitPort(string rawUrl, out int port)
         {
             port = 0;
-            if (string.IsNullOrWhiteSpace(rawUrl))
+            if (!TrySplitRawAuthorityText(rawUrl, out _, out string authority))
             {
                 return false;
             }
 
-            string trimmed = rawUrl.Trim();
-            int schemeEnd = trimmed.IndexOf("://", StringComparison.Ordinal);
-            if (schemeEnd < 0)
-            {
-                return false;
-            }
-
-            int authorityStart = schemeEnd + 3;
-            int authorityEnd = trimmed.Length;
-            foreach (char terminator in new[] { '/', '?', '#' })
-            {
-                int index = trimmed.IndexOf(terminator, authorityStart);
-                if (index >= 0 && index < authorityEnd)
-                {
-                    authorityEnd = index;
-                }
-            }
-
-            string authority = trimmed.Substring(authorityStart, authorityEnd - authorityStart);
+            // This port-only helper keeps its historical tolerance of userinfo; the managed
+            // validator refuses userinfo explicitly in TryExtractManagedAuthority.
             int hostStart = authority.LastIndexOf('@') + 1;
             if (hostStart >= authority.Length)
             {
@@ -443,8 +499,57 @@ namespace MCPForUnity.Editor.Services.Route
                 return false;
             }
 
-            string portText = authority.Substring(hostEnd + 1);
-            if (portText.Length == 0)
+            return TryParsePortText(authority.Substring(hostEnd + 1), out port);
+        }
+
+        /// <summary>
+        /// Splits the raw <c>scheme://authority</c> prefix out of URL text. This is the single
+        /// textual authority reader shared by <see cref="TryGetExplicitPort"/> and
+        /// <see cref="TryExtractManagedAuthority"/>, so the two can never disagree about where the
+        /// authority begins and ends. The authority is returned verbatim; nothing here
+        /// canonicalizes the host.
+        /// </summary>
+        private static bool TrySplitRawAuthorityText(
+            string rawUrl,
+            out string scheme,
+            out string authority)
+        {
+            scheme = null;
+            authority = null;
+
+            if (string.IsNullOrWhiteSpace(rawUrl))
+            {
+                return false;
+            }
+
+            string trimmed = rawUrl.Trim();
+            int schemeEnd = trimmed.IndexOf("://", StringComparison.Ordinal);
+            if (schemeEnd < 0)
+            {
+                return false;
+            }
+
+            scheme = trimmed.Substring(0, schemeEnd);
+
+            int authorityStart = schemeEnd + 3;
+            int authorityEnd = trimmed.Length;
+            foreach (char terminator in new[] { '/', '?', '#' })
+            {
+                int index = trimmed.IndexOf(terminator, authorityStart);
+                if (index >= 0 && index < authorityEnd)
+                {
+                    authorityEnd = index;
+                }
+            }
+
+            authority = trimmed.Substring(authorityStart, authorityEnd - authorityStart);
+            return authority.Length > 0;
+        }
+
+        private static bool TryParsePortText(string portText, out int port)
+        {
+            port = 0;
+            if (string.IsNullOrEmpty(portText))
             {
                 return false;
             }

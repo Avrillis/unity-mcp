@@ -69,6 +69,16 @@ the production `/api/command` and `/api/custom-tools` route bodies over a real S
 transport against a registry that contains a foreign session (inserted first) plus the guarded
 session (inserted second).
 
+### C17-R3-FIX4 addition (`McpFix4Tests.cs`)
+
+| Area | Behaviour under test |
+| --- | --- |
+| `McpRouteConfiguration` | the managed allowlist matches the **raw authority text**, read before `Uri`/`IPAddress` canonicalization: only `localhost` (case-insensitive), the literal `127.0.0.1` and the bracketed `[::1]` are accepted. Alternate spellings that the platform parser normalizes to 127.0.0.1 (`127.1`, `0177.0.0.1`, `2130706433`) are refused, as are malformed authorities (missing/empty/non-numeric port, port 0 or > 65535, userinfo, unbracketed colon hosts, non-http scheme, query/fragment, unexpected paths) |
+
+The FIX4 tests also cover `McpRouteConfiguration.TryExtractManagedAuthority`, the raw-authority
+reader shared with `TryGetExplicitPort`, and the end-to-end `Resolve` entry point so the alias
+spellings fail closed through the real configuration path.
+
 ## Companion checks
 
 * `tools/compile-check-dotnet.ps1` compiles the whole `MCPForUnity` Runtime + Editor assembly
