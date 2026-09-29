@@ -14,6 +14,12 @@ namespace MCPForUnity.Editor.Services.Route
     /// available source of package identity is collected and handed to
     /// <see cref="McpServerSourceResolver"/>, which refuses unless they all agree:
     ///
+    /// A <c>?path=</c> Git dependency is materialized under
+    /// <c>&lt;project&gt;/Library/PackageCache/&lt;package-name&gt;@&lt;fingerprint&gt;</c> with the package
+    /// contents at that root; the project's canonical PackageCache path is reported alongside so the
+    /// resolver can accept that layout structurally without relying on the folder name for
+    /// provenance.
+    ///
     ///   * the executing package, via <see cref="PackageInfo.FindForAssembly"/>;
     ///   * the installed package's own <c>package.json</c> at its resolved path;
     ///   * the project's direct dependency pin in <c>Packages/manifest.json</c>;
@@ -175,6 +181,9 @@ namespace MCPForUnity.Editor.Services.Route
                     !string.IsNullOrEmpty(packageRoot)
                     && !string.IsNullOrEmpty(packageCache)
                     && McpRunStatePaths.IsPathInside(packageRoot, packageCache),
+                // The only directory a materialized (com.coplaydev.unity-mcp@<fingerprint>) package
+                // folder may be a direct child of. Layout evidence only - never provenance.
+                ProjectPackageCachePath = packageCache,
             };
         }
 

@@ -38,6 +38,17 @@ namespace MCPForUnity.Editor.Services.Route
         /// not the pinned Git install this contract is written for.
         /// </summary>
         public bool ResolvedPathInsideProjectPackageCache;
+
+        /// <summary>
+        /// Canonical absolute path of the executing project's <c>Library/PackageCache</c> directory,
+        /// as reported by the Unity-facing adapter.
+        ///
+        /// It is used ONLY to prove structurally that a materialized UPM package folder is a direct
+        /// entry of THIS project's package cache. It carries no provenance: neither this directory
+        /// nor the <c>@&lt;fingerprint&gt;</c> suffix of a package folder name is ever compared to the
+        /// Git revision.
+        /// </summary>
+        public string ProjectPackageCachePath;
     }
 
     /// <summary>A Git dependency declared directly in <c>Packages/manifest.json</c>.</summary>
@@ -110,12 +121,18 @@ namespace MCPForUnity.Editor.Services.Route
     ///
     /// Invariants (any violation fails closed and yields no source):
     ///   * the executing package is exactly <c>com.coplaydev.unity-mcp</c> and is a Git package;
-    ///   * its resolved path exists inside the project's PackageCache and its own package.json
-    ///     agrees with the package manager's identity;
+    ///   * its resolved path exists inside the project's PackageCache in one of the two layouts UPM
+    ///     produces, its folder name is the package identity rather than a claim about the source,
+    ///     and its own package.json agrees with the package manager's identity;
     ///   * Packages/manifest.json declares it as a DIRECT Git dependency pinned to a FULL 40-hex
     ///     commit with <c>?path=/MCPForUnity</c>;
     ///   * Packages/packages-lock.json records the same repository and the same full commit;
     ///   * the resolved source is that repository at that commit, Server/ subdirectory.
+    ///
+    /// The installed folder name is a layout witness, never a revision: a <c>?path=</c> Git install
+    /// is materialized by UPM as <c>Library/PackageCache/&lt;package-name&gt;@&lt;fingerprint&gt;</c>, whose
+    /// suffix is UPM's content fingerprint. It is deliberately NOT compared to the Git commit and
+    /// never used to derive it.
     ///
     /// It never falls back to PyPI, a branch, a tag, a short id, a lock-only entry or a global
     /// override, and it never logs credentials.
@@ -124,6 +141,13 @@ namespace MCPForUnity.Editor.Services.Route
     {
         /// <summary>Subdirectory of the repository that holds the Python server.</summary>
         public const string ServerSubdirectory = "Server";
+
+        /// <summary>
+        /// Leaf name of the repository subfolder that holds the package. UPM materializes a
+        /// <c>?path=&lt;subfolder&gt;</c> Git dependency under this name when the package folder itself
+        /// is resolved; that layout is still accepted alongside the PackageCache layout.
+        /// </summary>
+        public const string NestedLayoutLeafName = "MCPForUnity";
 
         /// <summary>UPM source kind that carries a resolved repository and revision.</summary>
         public const string GitSourceKind = "git";
@@ -168,16 +192,19 @@ namespace MCPForUnity.Editor.Services.Route
                     + "revision can be derived from it.");
             }
 
-            // ---- C. the resolved path really is this package ---------------------------
+            // ---- C. the resolved path really is this project's installed package ---------
             if (string.IsNullOrWhiteSpace(installed.ResolvedPath)
                 || !installed.ResolvedPathExists
-                || !installed.ResolvedPathInsideProjectPackageCache
-                || !string.Equals(
-                    LeafName(installed.ResolvedPath), "MCPForUnity", StringComparison.OrdinalIgnoreCase))
+                || !installed.ResolvedPathInsideProjectPackageCache)
             {
                 return Refuse(result, "installed-path-mismatch",
-                    "the installed package path is not the 'MCPForUnity' folder of a "
-                    + "PackageCache Git install, so it does not match this contract.");
+                    "the installed package path is not inside this project's Library/PackageCache, "
+                    + "so it does not match this contract.");
+            }
+
+            if (!IsAcceptedInstalledPackageLayout(installed, out string layoutError))
+            {
+                return Refuse(result, "installed-path-mismatch", layoutError);
             }
 
             if (!string.Equals(installed.PackageJsonName, installed.Name, StringComparison.Ordinal))
@@ -654,6 +681,135 @@ namespace MCPForUnity.Editor.Services.Route
             string trimmed = path.Trim().TrimEnd('/', '\\');
             int index = Math.Max(trimmed.LastIndexOf('/'), trimmed.LastIndexOf('\\'));
             return index < 0 ? trimmed : trimmed.Substring(index + 1);
+        }
+
+        /// <summary>
+        /// Structural acceptance of the installed package folder. UPM produces two legitimate
+        /// shapes for a <c>?path=&lt;subfolder&gt;</c> Git dependency and both are accepted:
+        ///
+        ///   * the source/nested layout, where the resolved leaf is the repository subfolder
+        ///     (<see cref="NestedLayoutLeafName"/>);
+        ///   * the materialized layout, where the resolved folder is a DIRECT child of THIS
+        ///     project's <c>Library/PackageCache</c> and its leaf is the official package identity
+        ///     in UPM's form <c>com.coplaydev.unity-mcp@&lt;fingerprint&gt;</c>.
+        ///
+        /// This is a layout check only. It never derives or corroborates a repository, a revision
+        /// or a source; those come exclusively from the manifest and lock witnesses below. The
+        /// <c>@&lt;fingerprint&gt;</c> suffix is UPM's content fingerprint, is not assumed to be a Git
+        /// SHA, and is never compared to one.
+        /// </summary>
+        private static bool IsAcceptedInstalledPackageLayout(
+            McpInstalledPackageIdentity installed,
+            out string reason)
+        {
+            reason = null;
+
+            string resolved = McpRunStatePaths.Canonicalize(installed.ResolvedPath);
+            if (resolved.Length == 0)
+            {
+                reason = "the installed package path is not a usable filesystem path, so it does "
+                         + "not match this contract.";
+                return false;
+            }
+
+            string packageCache = McpRunStatePaths.Canonicalize(installed.ProjectPackageCachePath);
+            if (packageCache.Length == 0)
+            {
+                reason = "the installed package folder is not an entry of this project's "
+                         + "Library/PackageCache, so it does not match this contract.";
+                return false;
+            }
+
+            // Containment is re-proved here from the canonical paths themselves rather than merely
+            // trusting the caller's flag, so a traversal or canonicalization escape cannot be
+            // smuggled in as a path that only looks like it lives under this project's cache.
+            if (!McpRunStatePaths.IsPathInside(resolved, packageCache))
+            {
+                reason = "the installed package folder is not inside this project's "
+                         + "Library/PackageCache, so it does not match this contract.";
+                return false;
+            }
+
+            string leaf = LeafName(resolved);
+
+            // Layout A: the repository subfolder itself (source checkout / nested install).
+            if (string.Equals(leaf, NestedLayoutLeafName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Layout B: UPM's materialized PackageCache entry for this project.
+            if (!McpRunStatePaths.PathsEqual(ParentPath(resolved), packageCache))
+            {
+                reason = "the installed package folder is not a direct entry of this project's "
+                         + "Library/PackageCache, so it does not match this contract.";
+                return false;
+            }
+
+            if (!IsUpmMaterializedPackageLeaf(leaf))
+            {
+                reason = "the installed package folder does not name the official package "
+                         + $"'{ApprovedPackageName}' in UPM's materialized form, so it does not "
+                         + "match this contract.";
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// True when <paramref name="leaf"/> is the official package identity in UPM's materialized
+        /// form, <c>&lt;package-name&gt;@&lt;fingerprint&gt;</c>.
+        ///
+        /// The suffix is checked structurally only - present, non-empty, not merely punctuation and
+        /// free of separators, quoting and characters that could smuggle a different path entry.
+        /// Its value is never interpreted: it is UPM's content fingerprint, which has no relation to
+        /// the Git revision and must never be used as one.
+        /// </summary>
+        private static bool IsUpmMaterializedPackageLeaf(string leaf)
+        {
+            if (string.IsNullOrEmpty(leaf))
+            {
+                return false;
+            }
+
+            string prefix = ApprovedPackageName + "@";
+            if (!leaf.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            string fingerprint = leaf.Substring(prefix.Length);
+            if (fingerprint.Length == 0)
+            {
+                return false;
+            }
+
+            bool hasIdentity = false;
+            foreach (char c in fingerprint)
+            {
+                bool alphanumeric = (c >= '0' && c <= '9')
+                                    || (c >= 'a' && c <= 'z')
+                                    || (c >= 'A' && c <= 'Z');
+                if (alphanumeric)
+                {
+                    hasIdentity = true;
+                    continue;
+                }
+
+                if (c != '.' && c != '_' && c != '-')
+                {
+                    return false;
+                }
+            }
+
+            return hasIdentity;
+        }
+
+        private static string ParentPath(string canonicalPath)
+        {
+            int index = Math.Max(canonicalPath.LastIndexOf('/'), canonicalPath.LastIndexOf('\\'));
+            return index <= 0 ? string.Empty : canonicalPath.Substring(0, index);
         }
 
         private static McpServerSourceResolution Refuse(

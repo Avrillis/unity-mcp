@@ -562,6 +562,7 @@ namespace MCPForUnity.RouteIsolation.Tests
                 @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp@abc\MCPForUnity",
             bool resolvedPathExists = true,
             bool insidePackageCache = true,
+            string packageCachePath = @"C:\proj\Library\PackageCache",
             bool hasManifestEntry = true,
             bool directManifest = true,
             string manifestPackageName = McpServerSourceResolver.ApprovedPackageName,
@@ -582,6 +583,7 @@ namespace MCPForUnity.RouteIsolation.Tests
                     PackageJsonName = packageJsonName,
                     ResolvedPathExists = resolvedPathExists,
                     ResolvedPathInsideProjectPackageCache = insidePackageCache,
+                    ProjectPackageCachePath = packageCachePath,
                 },
                 Manifest = hasManifestEntry
                     ? new McpManifestGitDependency
@@ -796,13 +798,30 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void Provenance_ResolvedPathWhoseLeafIsNotMCPForUnityIsRefused()
+        public void Provenance_MaterializedPackageCacheLayoutIsAccepted()
         {
+            // FIX5: the real UPM shape for a ?path=/MCPForUnity Git dependency materializes the
+            // package contents directly at Library/PackageCache/<package>@<fingerprint>, so the leaf
+            // is the package identity and not "MCPForUnity". Acceptance rests on the layout plus the
+            // unchanged Git witnesses; the fingerprint is never treated as provenance.
             McpServerSourceResolution resolution =
                 McpServerSourceResolver.ResolveManaged(
                     Provenance(resolvedPath: @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp@abc"));
 
+            Assert.That(resolution.IsResolved, Is.True, resolution.Error);
+            Assert.That(resolution.Source, Is.EqualTo(ExpectedSource));
+            Assert.That(resolution.Revision, Is.EqualTo(ForkCommit));
+        }
+
+        [Test]
+        public void Provenance_MaterializedEntryForAnotherPackageIsRefused()
+        {
+            McpServerSourceResolution resolution =
+                McpServerSourceResolver.ResolveManaged(
+                    Provenance(resolvedPath: @"C:\proj\Library\PackageCache\com.coplaydev.unity-mcp-extra@abc"));
+
             Assert.That(resolution.IsResolved, Is.False);
+            Assert.That(resolution.Source, Is.Null);
             Assert.That(resolution.Category, Is.EqualTo("installed-path-mismatch"));
         }
 
