@@ -22,11 +22,6 @@ namespace MCPForUnity.RouteIsolation.Tests
     [TestFixture]
     public class McpFix6ManagedCacheTests
     {
-        // Temporary test roots are much longer than the real per-user root, so the deliberately
-        // short production length guard would reject them. Validation that is not about length uses
-        // this allowance; the length guard itself is exercised with the production default.
-        private const int TestMaxRootLength = 4096;
-
         private string _sandbox;
 
         [SetUp]
@@ -54,7 +49,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         private static McpManagedCachePreparation PrepareForTest(string projectRoot, string cacheRoot)
-            => McpManagedServerCache.Prepare(projectRoot, cacheRoot, TestMaxRootLength);
+            => McpManagedServerCache.Prepare(projectRoot, cacheRoot);
 
         // ------------------------------------------------------------------ 1/2. derivation
 
@@ -73,10 +68,6 @@ namespace MCPForUnity.RouteIsolation.Tests
                 Path.GetFileName(first),
                 Is.EqualTo(McpManagedServerCache.ManagedCacheDirectoryName));
             Assert.That(Directory.GetParent(first).FullName, Is.EqualTo(profile));
-            Assert.That(
-                first.Length,
-                Is.LessThanOrEqualTo(McpManagedServerCache.MaxManagedCacheRootLength),
-                "the managed root must stay deliberately short");
         }
 
         // ------------------------------------------------------------------ 3. independence
@@ -246,17 +237,16 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void Prepare_RejectsAnOverlyLongRootWithTheProductionGuard()
+        public void Prepare_DoesNotRejectAUsableRootBasedOnAnArbitraryLength()
         {
             string longRoot = Path.Combine(
-                _sandbox, new string('x', McpManagedServerCache.MaxManagedCacheRootLength));
+                _sandbox, new string('x', 65));
 
-            // Production default guard (no test allowance).
-            McpManagedCachePreparation result = McpManagedServerCache.Prepare(_sandbox, longRoot);
+            McpManagedCachePreparation result = McpManagedServerCache.Prepare(
+                Path.Combine(_sandbox, "Project"), longRoot);
 
-            Assert.That(result.Ok, Is.False);
-            Assert.That(result.Reason, Is.EqualTo("MANAGED_CACHE_ROOT_TOO_LONG"));
-            Assert.That(Directory.Exists(longRoot), Is.False, "a rejected root is never created");
+            Assert.That(result.Ok, Is.True, result.Detail);
+            Assert.That(Directory.Exists(longRoot), Is.True);
         }
 
         // ------------------------------------------------------------------ 11/12. containment
@@ -389,6 +379,9 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             int prepare = source.IndexOf(
                 "McpManagedServerCache.Prepare(", StringComparison.Ordinal);
+            int windowsGuard = source.LastIndexOf(
+                "Application.platform == RuntimePlatform.WindowsEditor", prepare,
+                StringComparison.Ordinal);
             int pendingRecord = source.IndexOf(
                 "var pendingRecord = new McpRunStateRecord", StringComparison.Ordinal);
             int apply = source.IndexOf(
@@ -397,6 +390,8 @@ namespace MCPForUnity.RouteIsolation.Tests
                 "System.Diagnostics.Process.Start(startInfo)", StringComparison.Ordinal);
 
             Assert.That(prepare, Is.GreaterThanOrEqualTo(0), "the launch must prepare the managed cache");
+            Assert.That(windowsGuard, Is.GreaterThanOrEqualTo(0),
+                "only the Windows launch needs a short uv cache");
             Assert.That(pendingRecord, Is.GreaterThan(prepare),
                 "cache preparation must precede the pending ownership record");
             Assert.That(apply, Is.GreaterThan(pendingRecord),

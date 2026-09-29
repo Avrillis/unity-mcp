@@ -463,18 +463,18 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            // ---- managed uv cache: prepared BEFORE any pending ownership record ----
-            // The managed server source is fetched by uv from the reviewed revision, and uv
-            // materializes that fetch beneath its cache directory. A deliberately short per-user
-            // root keeps that checkout clear of platform path limits, so the managed launch must
-            // not silently inherit an arbitrary cache location. Preparation is fail-closed and
-            // deliberately ordered ahead of the ownership record below: a cache problem must not
-            // leave a pending "starting" record behind.
-            McpManagedCachePreparation managedCache = McpManagedServerCache.Prepare(GetCanonicalProjectRoot());
-            if (!managedCache.Ok)
+            // Windows needs a short uv cache path for the immutable server checkout. Prepare it
+            // before publishing any pending ownership record; other platforms keep their existing
+            // uv cache behavior.
+            McpManagedCachePreparation managedCache = null;
+            if (Application.platform == RuntimePlatform.WindowsEditor)
             {
-                ReportStartFailure(quiet, "Cannot Start HTTP Server", managedCache.Detail);
-                return false;
+                managedCache = McpManagedServerCache.Prepare(GetCanonicalProjectRoot());
+                if (!managedCache.Ok)
+                {
+                    ReportStartFailure(quiet, "Cannot Start HTTP Server", managedCache.Detail);
+                    return false;
+                }
             }
 
             // ---- ownership gate: never adopt or overwrite a foreign live server ----
@@ -664,19 +664,20 @@ namespace MCPForUnity.Editor.Services
                         + $"this managed launch: {string.Join(", ", strippedRouting)}.");
                 }
 
-                // The managed server must use the reviewed short per-user uv cache even when the
-                // Editor inherited a different cache location, because managed launch correctness
-                // must not depend on an arbitrary parent value. This is child-process only: no
-                // global setting, no Editor environment and no repository configuration changes.
-                McpManagedCacheApplication cacheApplication =
-                    McpManagedServerCache.ApplyTo(startInfo.EnvironmentVariables, managedCache.Root);
-                if (cacheApplication.OverrodeInheritedValue)
+                // On Windows, give this child the prepared short uv cache even if the Editor
+                // inherited a different location. Other platforms keep their inherited setting.
+                if (managedCache != null)
                 {
-                    McpLog.Warn(
-                        "[MCP Route] Replaced the inherited "
-                        + McpManagedServerCache.CacheDirectoryEnvironmentVariable
-                        + " value for this managed server launch with the managed per-user cache "
-                        + $"at '{managedCache.Root}'.");
+                    McpManagedCacheApplication cacheApplication =
+                        McpManagedServerCache.ApplyTo(startInfo.EnvironmentVariables, managedCache.Root);
+                    if (cacheApplication.OverrodeInheritedValue)
+                    {
+                        McpLog.Warn(
+                            "[MCP Route] Replaced the inherited "
+                            + McpManagedServerCache.CacheDirectoryEnvironmentVariable
+                            + " value for this managed server launch with the managed per-user cache "
+                            + $"at '{managedCache.Root}'.");
+                    }
                 }
 
                 // The headless shell is not a login shell, so it does not inherit the user's

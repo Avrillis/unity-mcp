@@ -73,16 +73,6 @@ namespace MCPForUnity.Editor.Services.Route
         public const string ManagedCacheDirectoryName = ".swm-uv";
 
         /// <summary>
-        /// Defensive bound on the managed root itself.
-        ///
-        /// This is not a computed budget for any tool's internal directory layout: it exists so a
-        /// pathologically long user profile is refused with an actionable error instead of
-        /// producing an obscure downstream failure. The root is expected to be far shorter than
-        /// this (for example <c>%USERPROFILE%\.swm-uv</c>).
-        /// </summary>
-        public const int MaxManagedCacheRootLength = 64;
-
-        /// <summary>
         /// The managed cache root for the current user, or an empty string when no user profile is
         /// available. Resolution is deterministic and independent of the repository, the current
         /// directory, the worker slot, the task and the route port.
@@ -127,15 +117,9 @@ namespace MCPForUnity.Editor.Services.Route
         /// used; tests supply isolated temporary roots. An explicitly supplied but blank value is
         /// invalid rather than silently replaced by the default.
         /// </param>
-        /// <param name="maxRootLength">
-        /// Length guard applied to the managed root. The production default keeps the root
-        /// deliberately short; tests that exercise unrelated validation pass a larger allowance
-        /// because temporary test roots are longer than the real per-user root.
-        /// </param>
         public static McpManagedCachePreparation Prepare(
             string projectRoot,
-            string cacheRoot = null,
-            int maxRootLength = MaxManagedCacheRootLength)
+            string cacheRoot = null)
         {
             var result = new McpManagedCachePreparation();
 
@@ -178,16 +162,6 @@ namespace MCPForUnity.Editor.Services.Route
             }
 
             result.Root = canonical;
-
-            if (maxRootLength > 0 && canonical.Length > maxRootLength)
-            {
-                return Fail(
-                    result,
-                    "MANAGED_CACHE_ROOT_TOO_LONG",
-                    $"The managed uv cache root '{canonical}' is {canonical.Length} characters; a "
-                    + $"root of at most {maxRootLength} characters is required so the "
-                    + "immutable server checkout stays short. The managed server was not launched.");
-            }
 
             string project = string.Empty;
             if (!string.IsNullOrWhiteSpace(projectRoot))
