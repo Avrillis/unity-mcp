@@ -32,6 +32,7 @@
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpTerminationIdentity.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerSourceResolver.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpServerEnvironmentSanitizer.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedServerCache.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpClientRoute.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/McpManagedServerArguments.cs" />
     <Compile Include="../../MCPForUnity/Editor/Services/Route/IMcpRouteStateStore.cs" />
