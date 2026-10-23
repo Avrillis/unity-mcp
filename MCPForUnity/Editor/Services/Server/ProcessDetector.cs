@@ -13,6 +13,18 @@ namespace MCPForUnity.Editor.Services.Server
     /// </summary>
     public class ProcessDetector : IProcessDetector
     {
+        // Test seam for the Windows command-line query only. Null means the real, bounded runner.
+        private readonly IWindowsCommandRunner _windowsCommandRunner;
+
+        public ProcessDetector() : this(null)
+        {
+        }
+
+        internal ProcessDetector(IWindowsCommandRunner windowsCommandRunner)
+        {
+            _windowsCommandRunner = windowsCommandRunner;
+        }
+
         /// <inheritdoc/>
         public string NormalizeForMatch(string input)
         {
@@ -67,15 +79,17 @@ namespace MCPForUnity.Editor.Services.Server
             {
                 if (Application.platform == RuntimePlatform.WindowsEditor)
                 {
-                    // Windows: use wmic to get command line
-                    ExecPath.TryRun("cmd.exe", $"/c wmic process where \"ProcessId={pid}\" get CommandLine /value", Application.dataPath, out var wmicOut, out var wmicErr, 5000);
-                    string wmicCombined = ((wmicOut ?? string.Empty) + "\n" + (wmicErr ?? string.Empty));
-                    if (!string.IsNullOrEmpty(wmicCombined) && wmicCombined.ToLowerInvariant().Contains("commandline="))
+                    // Windows: read the exact command line through CIM (Win32_Process) using the fixed
+                    // system PowerShell. wmic.exe was removed from current Windows 11 releases, and
+                    // without a command line the managed ownership proof can never succeed.
+                    // Anything other than one well-formed result is a failure (fail closed).
+                    if (!WindowsProcessCommandLine.TryGetCommandLine(pid, _windowsCommandRunner, out string commandLine))
                     {
-                        argsLower = NormalizeForMatch(wmicOut ?? string.Empty);
-                        return true;
+                        return false;
                     }
-                    return false;
+
+                    argsLower = NormalizeForMatch(commandLine);
+                    return !string.IsNullOrEmpty(argsLower);
                 }
 
                 // Unix: ps -p pid -ww -o args=
@@ -175,7 +189,7 @@ namespace MCPForUnity.Editor.Services.Server
         {
             try
             {
-                // Windows best-effort: First check process name with tasklist, then try to get command line with wmic
+                // Windows best-effort: First check process name with tasklist, then try to get the command line via CIM
                 if (Application.platform == RuntimePlatform.WindowsEditor)
                 {
                     // Step 1: Check if process name matches known server executables
@@ -189,20 +203,20 @@ namespace MCPForUnity.Editor.Services.Server
                         return false;
                     }
 
-                    // Step 2: Try to get command line with wmic for better validation
-                    ExecPath.TryRun("cmd.exe", $"/c wmic process where \"ProcessId={pid}\" get CommandLine /value", Application.dataPath, out var wmicOut, out var wmicErr, 5000);
-                    string wmicCombined = ((wmicOut ?? string.Empty) + "\n" + (wmicErr ?? string.Empty)).ToLowerInvariant();
-                    string wmicCompact = NormalizeForMatch(wmicOut ?? string.Empty);
+                    // Step 2: Try to get the command line (CIM, no wmic) for better validation
+                    bool haveCommandLine = WindowsProcessCommandLine.TryGetCommandLine(pid, _windowsCommandRunner, out string rawCommandLine);
+                    string cmdLower = haveCommandLine ? rawCommandLine.ToLowerInvariant() : string.Empty;
+                    string cmdCompact = haveCommandLine ? NormalizeForMatch(rawCommandLine) : string.Empty;
 
                     // If we can see the command line, validate it's our server
-                    if (!string.IsNullOrEmpty(wmicCombined) && wmicCombined.Contains("commandline="))
+                    if (haveCommandLine && !string.IsNullOrEmpty(cmdLower))
                     {
-                        bool mentionsMcp = wmicCompact.Contains("mcp-for-unity")
-                                           || wmicCompact.Contains("mcp_for_unity")
-                                           || wmicCompact.Contains("mcpforunity")
-                                           || wmicCompact.Contains("mcpforunityserver");
-                        bool mentionsTransport = wmicCompact.Contains("--transporthttp") || (wmicCompact.Contains("--transport") && wmicCompact.Contains("http"));
-                        bool mentionsUvicorn = wmicCombined.Contains("uvicorn");
+                        bool mentionsMcp = cmdCompact.Contains("mcp-for-unity")
+                                           || cmdCompact.Contains("mcp_for_unity")
+                                           || cmdCompact.Contains("mcpforunity")
+                                           || cmdCompact.Contains("mcpforunityserver");
+                        bool mentionsTransport = cmdCompact.Contains("--transporthttp") || (cmdCompact.Contains("--transport") && cmdCompact.Contains("http"));
+                        bool mentionsUvicorn = cmdLower.Contains("uvicorn");
 
                         if (mentionsMcp || mentionsTransport || mentionsUvicorn)
                         {
@@ -210,8 +224,8 @@ namespace MCPForUnity.Editor.Services.Server
                         }
                     }
 
-                    // Fall back to just checking for python/uv processes if wmic didn't give us details
-                    // This is less precise but necessary for cases where wmic access is restricted
+                    // Fall back to just checking for python/uv processes if no command line was available
+                    // This is less precise but necessary for cases where process metadata access is restricted
                     return isPythonOrUv;
                 }
 

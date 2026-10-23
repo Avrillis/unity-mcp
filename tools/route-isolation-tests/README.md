@@ -87,6 +87,26 @@ spellings fail closed through the real configuration path.
 * `Server/tests/test_route_guard.py` covers the narrow Python server-side guard
   (`--unity-project-root`, launch nonce, foreign registration, cross-target dispatch).
 
+### MCP-WIN-01 addition (`McpWin01Tests.cs`)
+
+Windows 11 no longer ships `wmic.exe`. The package used it to read the dedicated server's command
+line, so the ownership proof could never confirm the launch nonce and a managed `starting` record
+was never promoted to `running`. `WindowsProcessCommandLine.cs` now reads the command line through
+CIM (`Win32_Process`) using the fixed in-box Windows PowerShell.
+
+| Area | Behaviour under test |
+| --- | --- |
+| `WindowsProcessCommandLine` query | only a validated positive integer PID reaches the query; the executable is the fixed absolute system path; the run is time-bounded; invalid PIDs never launch anything |
+| Output parser | exactly one well-formed result line; Base64 UTF-8 round-trips quotes, spaces, backslashes, Unicode and fake status markers verbatim; non-zero exit, timeout, truncation, empty, malformed, non-strict Base64, invalid UTF-8 and NUL are all rejected |
+| Live Windows queries | a real child process (quotes, spaces, Unicode), the test process itself, a nonexistent PID, a terminated PID, a process whose metadata the OS withholds, and a real timeout (these run only on Windows) |
+| `ProcessDetector` (production class) | the normalized lower-case contract is unchanged; every failure mode returns false and an empty value |
+| Ownership chain | the real `McpProcessInspector` + `ProcessDetector` + `McpRouteObservationBuilder` + `McpOwnershipEvaluator` + `McpManagedConnectionGate`: a valid WORKER-04-style server is promoted and the nonce released; an unreadable command line, nonce mismatch, wrong port, other worktree, PID reuse, other editor lifetime, multiple or foreign listeners, missing server, bad PID file and an adoption of another lifetime's pending record are all refused |
+
+`ProcessDetector.cs` and `McpProcessInspector.cs` are the real production classes. They compile
+against `UnityApiShims.cs`, a few lines of test-only stand-ins for `Application`, `RuntimePlatform`,
+`McpLog` and `ExecPath`, so nothing in the shipped package changes for testing.
+
+Cross-target dispatch refusal is a server-side behaviour (`Server/tests/test_route_guard.py`).
 ## Why the sources are compiled, not referenced
 
 The Route sources deliberately contain no `UnityEngine`/`UnityEditor` references. That keeps

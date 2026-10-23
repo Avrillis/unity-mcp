@@ -39,6 +39,18 @@
     <Compile Include="../../MCPForUnity/Editor/Services/Route/IMcpProcessInspector.cs" />
   </ItemGroup>
 
+  <!--
+    MCP-WIN-01: the Windows process command-line query. WindowsProcessCommandLine.cs is
+    Unity-free. ProcessDetector.cs and McpProcessInspector.cs are the REAL production classes;
+    they compile against the tiny UnityApiShims.cs stand-ins (test-only) instead of Unity.
+  -->
+  <ItemGroup>
+    <Compile Include="../../MCPForUnity/Editor/Services/Server/WindowsProcessCommandLine.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Server/IProcessDetector.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Server/ProcessDetector.cs" />
+    <Compile Include="../../MCPForUnity/Editor/Services/Route/McpProcessInspector.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
     <PackageReference Include="NUnit" Version="4.2.2" />
