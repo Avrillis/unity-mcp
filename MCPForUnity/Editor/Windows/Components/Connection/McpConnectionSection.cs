@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Clients;
 using MCPForUnity.Editor.Constants;
@@ -702,6 +703,14 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     {
                         await bridgeService.StopAsync();
                     }
+
+                    // Let the ownership proof gather its slow evidence (the server's command line)
+                    // without freezing the Editor, so the stop below finds it already complete.
+                    using (var evidenceBudget = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+                    {
+                        await MCPServiceLocator.Server.PrepareOwnershipEvidenceAsync(evidenceBudget.Token);
+                    }
+
                     bool stopped = MCPServiceLocator.Server.StopLocalHttpServer();
                     if (stopped)
                     {

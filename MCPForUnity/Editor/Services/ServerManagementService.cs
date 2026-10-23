@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
@@ -752,6 +753,54 @@ namespace MCPForUnity.Editor.Services
             }
 
             return TryStopOwnedServer(record, endpoint, quiet: true);
+        }
+
+        /// <inheritdoc/>
+        public async Task PrepareOwnershipEvidenceAsync(CancellationToken cancellationToken)
+        {
+            // Everything that touches Unity or the ownership record is read synchronously, before the
+            // first await, in the caller's own context. Only the waiting itself is asynchronous.
+            int serverPid;
+            try
+            {
+                if (!McpRouteProvider.Configuration.IsValid)
+                {
+                    return;
+                }
+
+                McpRunStateRecord record = ReadOwnershipRecord();
+                if (record == null)
+                {
+                    return;
+                }
+
+                serverPid = record.ServerPid;
+                if (serverPid <= 0)
+                {
+                    int port = GetPortFromEndpoint(GetEffectiveEndpoint());
+                    string pidFile = port > 0 ? GetLocalHttpServerPidFilePath(port) : null;
+                    if (string.IsNullOrEmpty(pidFile) || !_routeStateStore.TryReadPidFile(pidFile, out serverPid, out _))
+                    {
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+                return;
+            }
+
+            if (serverPid > 0)
+            {
+                try
+                {
+                    await _processDetector.PrefetchProcessCommandLineAsync(serverPid, cancellationToken);
+                }
+                catch
+                {
+                    // No evidence was gathered; the stop that follows refuses on its own.
+                }
+            }
         }
 
         public bool IsLocalHttpServerRunning()

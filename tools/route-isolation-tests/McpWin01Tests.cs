@@ -4,6 +4,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Services.Route;
 using MCPForUnity.Editor.Services.Server;
 using NUnit.Framework;
@@ -15,10 +17,12 @@ namespace MCPForUnity.RouteIsolation.Tests
     /// </summary>
     internal static class Win01
     {
-        // Values taken from the real WORKER-04 incident so the scenarios stay realistic.
-        public const string Worker04Root = @"C:\Users\Avril\The Last Noob-workers\WORKER-04-F13-SP-WORLD-01";
-        public const string Worker03Root = @"C:\Users\Avril\The Last Noob-workers\WORKER-03-OTHER-TASK";
-        public const string Endpoint = "http://127.0.0.1:8081";
+        // Synthetic values shaped like a managed worker launch (spaces, hyphens, a per-user uv cache),
+        // deliberately containing no real user, machine or project names.
+        public const string Worker04Root = @"C:\Users\Example User\Sample Game-workers\WORKER-04-SAMPLE";
+        public const string Worker03Root = @"C:\Users\Example User\Sample Game-workers\WORKER-03-OTHER";
+        public const string Endpoint = "http://127.0.0.1:8181";
+        public const int Port = 8181;
         public const string Token = "29bc72d164934bf8963cb94c9157e016";
         public const string OtherToken = "f690aa11bb22cc33dd44ee55ff667788";
         public const int EditorPid = 120468;
@@ -29,11 +33,11 @@ namespace MCPForUnity.RouteIsolation.Tests
         public static readonly DateTime ServerStart = new DateTime(2026, 10, 23, 13, 35, 2, DateTimeKind.Utc).AddTicks(7661180);
 
         public static string ServerCommandLine(string root, string endpoint, string token)
-            => "\"C:\\Users\\Avril\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\python.exe\" "
-               + "\"C:\\Users\\Avril\\.swm-uv\\archive-v0\\suZA0SsXkyMEGT3-\\Scripts\\mcp-for-unity.exe\" "
+            => "\"C:\\Users\\Example User\\AppData\\Roaming\\uv\\python\\cpython-3.12-windows-x86_64-none\\python.exe\" "
+               + "\"C:\\Users\\Example User\\.uv-cache\\archive-v0\\EXAMPLEARCHIVE\\Scripts\\mcp-for-unity.exe\" "
                + $"--transport http --http-url {endpoint} --unity-project-root \"{root}\" "
                + "--project-scoped-tools "
-               + $"--pidfile \"{root}\\Library\\MCPForUnity\\RunState\\mcp_http_8081.pid\" "
+               + $"--pidfile \"{root}\\Library\\MCPForUnity\\RunState\\mcp_http_8181.pid\" "
                + $"--unity-instance-token {token}";
 
         /// <summary>What the PowerShell query prints for a readable command line.</summary>
@@ -42,13 +46,38 @@ namespace MCPForUnity.RouteIsolation.Tests
             {
                 Started = true,
                 ExitCode = 0,
-                StandardOutput = "OK:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(commandLine)) + "\r\n",
+                StandardOutput = OkLine(commandLine) + "\r\n",
+                OutputComplete = true,
             };
 
         public static WindowsCommandRunOutcome Raw(string stdout, int exit = 0)
-            => new WindowsCommandRunOutcome { Started = true, ExitCode = exit, StandardOutput = stdout };
+            => new WindowsCommandRunOutcome { Started = true, ExitCode = exit, StandardOutput = stdout, OutputComplete = true };
 
         public static string B64(string text) => Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
+
+        /// <summary>The exact result line the query prints: OK:&lt;byte count&gt;:&lt;Base64 of the UTF-8 bytes&gt;.</summary>
+        public static string OkLine(string commandLine)
+            => OkLine(Encoding.UTF8.GetBytes(commandLine));
+
+        public static string OkLine(byte[] bytes)
+            => "OK:" + bytes.Length + ":" + Convert.ToBase64String(bytes);
+
+        /// <summary>
+        /// A detector whose observer uses a scripted PowerShell launch and a scripted process
+        /// lifetime, so tests with invented PIDs can still bind a result to a lifetime.
+        /// </summary>
+        public static ProcessDetector DetectorFor(IWindowsCommandRunner runner, Func<int, DateTime?> lifetimeOf = null)
+            => new ProcessDetector(ObserverFor(runner, lifetimeOf));
+
+        public static ProcessCommandLineObserver ObserverFor(IWindowsCommandRunner runner, Func<int, DateTime?> lifetimeOf = null)
+            => new ProcessCommandLineObserver(
+                lifetimeOf ?? (_ => ServerStart),
+                (pid, token) => WindowsProcessCommandLine.Query(
+                    pid, runner, null, WindowsProcessCommandLine.DefaultTimeoutMs, token));
+
+        /// <summary>Waits (off any Editor thread) until the detector's query for this PID is final.</summary>
+        public static void Prime(ProcessDetector detector, int pid)
+            => detector.PrefetchProcessCommandLineAsync(pid, CancellationToken.None).GetAwaiter().GetResult();
     }
 
     /// <summary>Replaces the PowerShell launch with a scripted outcome and records how it was called.</summary>
@@ -65,18 +94,22 @@ namespace MCPForUnity.RouteIsolation.Tests
         {
         }
 
-        public int Calls { get; private set; }
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
         public string LastExecutable { get; private set; }
         public string LastArguments { get; private set; }
         public int LastTimeoutMs { get; private set; }
+        public WindowsCommandRunRequest LastRequest { get; private set; }
 
-        public WindowsCommandRunOutcome Run(string executablePath, string arguments, int timeoutMs)
+        public WindowsCommandRunOutcome Run(WindowsCommandRunRequest request, CancellationToken cancellationToken)
         {
-            Calls++;
-            LastExecutable = executablePath;
-            LastArguments = arguments;
-            LastTimeoutMs = timeoutMs;
-            return _handler(executablePath, arguments, timeoutMs);
+            Interlocked.Increment(ref _calls);
+            LastRequest = request;
+            LastExecutable = request.ExecutablePath;
+            LastArguments = request.Arguments;
+            LastTimeoutMs = request.TimeoutMs;
+            return _handler(request.ExecutablePath, request.Arguments, request.TimeoutMs);
         }
     }
 
@@ -195,19 +228,17 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void TryGetCommandLine_ReturnsExactStringOnlyOnSuccess()
+        public void Query_ReturnsTheExactStringOnlyOnSuccess()
         {
             string line = Win01.ServerCommandLine(Win01.Worker04Root, Win01.Endpoint, Win01.Token);
 
-            Assert.That(
-                WindowsProcessCommandLine.TryGetCommandLine(5, new ScriptedRunner(Win01.Ok(line)), out string ok),
-                Is.True);
-            Assert.That(ok, Is.EqualTo(line));
+            WindowsCommandLineResult ok = WindowsProcessCommandLine.Query(5, new ScriptedRunner(Win01.Ok(line)));
+            Assert.That(ok.Succeeded, Is.True);
+            Assert.That(ok.CommandLine, Is.EqualTo(line));
 
-            Assert.That(
-                WindowsProcessCommandLine.TryGetCommandLine(5, new ScriptedRunner(Win01.Raw("NOTFOUND")), out string none),
-                Is.False);
-            Assert.That(none, Is.Null);
+            WindowsCommandLineResult none = WindowsProcessCommandLine.Query(5, new ScriptedRunner(Win01.Raw("NOTFOUND")));
+            Assert.That(none.Succeeded, Is.False);
+            Assert.That(none.CommandLine, Is.Null);
         }
 
         // ---- output parser -------------------------------------------------------------
@@ -217,11 +248,11 @@ namespace MCPForUnity.RouteIsolation.Tests
             yield return new TestCaseData("python.exe --x 1").SetName("plain");
             yield return new TestCaseData(Win01.ServerCommandLine(Win01.Worker04Root, Win01.Endpoint, Win01.Token))
                 .SetName("worker04_server_with_spaces_and_quotes");
-            yield return new TestCaseData(@"""C:\Program Files\Unity\Hub\Editor\6000.5.6f1\Editor\Unity.exe"" -projectPath ""C:\Users\Avril\The Last Noob-workers\W 04""")
+            yield return new TestCaseData(@"""C:\Program Files\Unity\Hub\Editor\6000.5.6f1\Editor\Unity.exe"" -projectPath ""C:\Users\Example User\Sample Game-workers\W 04""")
                 .SetName("quoted_paths_with_spaces");
             yield return new TestCaseData(@"tool.exe --dir C:\path\with\trailing\backslash\ ""C:\ends with slash\""")
                 .SetName("backslashes_and_escaped_quote");
-            yield return new TestCaseData("tool.exe --root \"C:\\Users\\Avril\\Dev\\Ünï cödé 日本語\\proj x\" --emoji \ud83d\ude80")
+            yield return new TestCaseData("tool.exe --root \"C:\\Users\\Example User\\Dev\\Ünï cödé 日本語\\proj x\" --emoji \ud83d\ude80")
                 .SetName("unicode_and_surrogate_pair");
             yield return new TestCaseData("tool.exe a&b|c^d%PATH%$env:X`y;z=1 'single' <in >out")
                 .SetName("shell_special_characters_are_data");
@@ -244,13 +275,13 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void Parse_ToleratesBlankLinesAndCrLfAroundTheSingleResult()
         {
-            string b = Win01.B64("tool.exe --ok");
+            string b = Win01.OkLine("tool.exe --ok");
 
             Assert.That(
-                WindowsProcessCommandLine.ParseOutcome(Win01.Raw("\r\n\r\nOK:" + b + "\r\n\r\n")).CommandLine,
+                WindowsProcessCommandLine.ParseOutcome(Win01.Raw("\r\n\r\n" + b + "\r\n\r\n")).CommandLine,
                 Is.EqualTo("tool.exe --ok"));
             Assert.That(
-                WindowsProcessCommandLine.ParseOutcome(Win01.Raw("  OK:" + b + "  \n")).CommandLine,
+                WindowsProcessCommandLine.ParseOutcome(Win01.Raw("  " + b + "  \n")).CommandLine,
                 Is.EqualTo("tool.exe --ok"));
         }
 
@@ -275,7 +306,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void Parse_NotStarted_Timeout_NonZeroExit_AndTruncation_AreAllFailures()
         {
-            string good = "OK:" + Win01.B64("tool.exe --ok");
+            string good = Win01.OkLine("tool.exe --ok");
 
             Assert.That(
                 WindowsProcessCommandLine.ParseOutcome(new WindowsCommandRunOutcome { Started = false, StandardOutput = good }).Status,
@@ -283,7 +314,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             Assert.That(WindowsProcessCommandLine.ParseOutcome(null).Status, Is.EqualTo(WindowsCommandLineStatus.RunFailed));
 
             WindowsCommandLineResult timeout = WindowsProcessCommandLine.ParseOutcome(
-                new WindowsCommandRunOutcome { Started = true, TimedOut = true, ExitCode = 0, StandardOutput = good });
+                new WindowsCommandRunOutcome { Started = true, TimedOut = true, ExitCode = 0, StandardOutput = good, OutputComplete = true });
             Assert.That(timeout.Status, Is.EqualTo(WindowsCommandLineStatus.TimedOut));
             Assert.That(timeout.Succeeded, Is.False, "a timed-out query is never trusted even if it printed a result");
 
@@ -292,7 +323,7 @@ namespace MCPForUnity.RouteIsolation.Tests
             Assert.That(exit1.Succeeded, Is.False);
 
             WindowsCommandLineResult truncated = WindowsProcessCommandLine.ParseOutcome(
-                new WindowsCommandRunOutcome { Started = true, ExitCode = 0, StandardOutput = good, OutputTruncated = true });
+                new WindowsCommandRunOutcome { Started = true, ExitCode = 0, StandardOutput = good, OutputTruncated = true, OutputComplete = true });
             Assert.That(truncated.Status, Is.EqualTo(WindowsCommandLineStatus.MalformedOutput));
         }
 
@@ -308,10 +339,24 @@ namespace MCPForUnity.RouteIsolation.Tests
         [TestCase("OK:AAAA!")]
         [TestCase("OK:AA\u00e9A")]
         // .NET's own decoder silently ignores whitespace; the strict check must not.
-        [TestCase("OK: dG9vbA==")]
-        [TestCase("OK:dG9v bA==")]
-        [TestCase("OK:dG9vbA== ==")]
-        [TestCase("OK:dG9vbA ==")]
+        [TestCase("OK:4: dG9vbA==")]
+        [TestCase("OK:4:dG9v bA==")]
+        [TestCase("OK:4:dG9vbA== ==")]
+        [TestCase("OK:4:dG9vbA ==")]
+        // The declared byte count must match exactly.
+        [TestCase("OK:5:dG9vbA==")]
+        [TestCase("OK:3:dG9vbA==")]
+        [TestCase("OK:0:dG9vbA==")]
+        [TestCase("OK:-4:dG9vbA==")]
+        [TestCase("OK:+4:dG9vbA==")]
+        [TestCase("OK:4 :dG9vbA==")]
+        [TestCase("OK:x:dG9vbA==")]
+        [TestCase("OK:4")]
+        [TestCase("OK:4:")]
+        [TestCase("OK::dG9vbA==")]
+        [TestCase("OK:99999999999:dG9vbA==")]
+        // No length at all is not the protocol.
+        [TestCase("OK:dG9vbA==")]
         [TestCase("NOTFOUND extra")]
         [TestCase("NULL\nNOTFOUND")]
         [TestCase("WARNING: noise\nOK:dG9vbA==")]
@@ -327,9 +372,9 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void Parse_ValidBase64ThatIsNotValidUtf8_OrIsEmptyOrContainsNul_IsRejected()
         {
-            string invalidUtf8 = "OK:" + Convert.ToBase64String(new byte[] { 0xFF, 0xFE, 0xFD, 0x41 });
-            string empty = "OK:" + Convert.ToBase64String(new byte[0]);
-            string nul = "OK:" + Win01.B64("tool.exe\0--x");
+            string invalidUtf8 = Win01.OkLine(new byte[] { 0xFF, 0xFE, 0xFD, 0x41 });
+            string empty = "OK:0:";
+            string nul = Win01.OkLine("tool.exe\0--x");
 
             foreach (string stdout in new[] { invalidUtf8, empty, nul })
             {
@@ -347,7 +392,8 @@ namespace MCPForUnity.RouteIsolation.Tests
                 Started = true,
                 ExitCode = 0,
                 StandardOutput = string.Empty,
-                StandardError = "OK:" + Win01.B64("tool.exe --forged"),
+                StandardError = Win01.OkLine("tool.exe --forged"),
+                OutputComplete = true,
             };
 
             Assert.That(WindowsProcessCommandLine.ParseOutcome(outcome).Succeeded, Is.False);
@@ -425,7 +471,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void Child_WithQuotesSpacesAndUnicode_ReturnsTheExactCommandLine()
         {
             string marker = "--unity-instance-token " + Win01.Token
-                            + " --unity-project-root \"C:\\Users\\Avril\\Dev\\Ünï cödé 日本語\\WORKER 04\\proj x\""
+                            + " --unity-project-root \"C:\\Users\\Example User\\Dev\\Ünï cödé 日本語\\WORKER 04\\proj x\""
                             + " --http-url " + Win01.Endpoint;
 
             using (var child = new MarkerChild(marker))
@@ -502,7 +548,10 @@ namespace MCPForUnity.RouteIsolation.Tests
 
             using (var child = new MarkerChild(marker))
             {
-                var detector = new ProcessDetector();
+                var detector = new ProcessDetector(new ProcessCommandLineObserver(
+                    ProcessCommandLineObserver.ReadProcessCreationUtc,
+                    (pid, token) => WindowsProcessCommandLine.Query(pid, null, null, WindowsProcessCommandLine.DefaultTimeoutMs, token)));
+                Win01.Prime(detector, child.Process.Id);
 
                 bool ok = detector.TryGetProcessCommandLine(child.Process.Id, out string argsLower);
 
@@ -518,7 +567,9 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void TheRealProcessDetector_RejectsAnAbsentProcess()
         {
-            var detector = new ProcessDetector();
+            var detector = new ProcessDetector(new ProcessCommandLineObserver(
+                ProcessCommandLineObserver.ReadProcessCreationUtc,
+                (pid, token) => WindowsProcessCommandLine.Query(pid, null, null, WindowsProcessCommandLine.DefaultTimeoutMs, token)));
 
             Assert.That(detector.TryGetProcessCommandLine(2147483000, out string argsLower), Is.False);
             Assert.That(argsLower, Is.Empty);
@@ -541,13 +592,14 @@ namespace MCPForUnity.RouteIsolation.Tests
             yield return new TestCaseData(Win01.Raw("NULL")).SetName("command_line_unavailable_or_access_denied");
             yield return new TestCaseData(Win01.Raw("")).SetName("empty_output");
             yield return new TestCaseData(Win01.Raw("OK:@@@@")).SetName("malformed_payload");
-            yield return new TestCaseData(Win01.Raw("OK:" + Win01.B64("x"), exit: 5)).SetName("non_zero_exit");
+            yield return new TestCaseData(Win01.Raw(Win01.OkLine("x"), exit: 5)).SetName("non_zero_exit");
         }
 
         [TestCaseSource(nameof(FailureOutcomes))]
         public void EveryFailureMode_FailsClosed(WindowsCommandRunOutcome outcome)
         {
-            var detector = new ProcessDetector(new ScriptedRunner(outcome));
+            ProcessDetector detector = Win01.DetectorFor(new ScriptedRunner(outcome));
+            Win01.Prime(detector, 5150);
 
             Assert.That(detector.TryGetProcessCommandLine(5150, out string argsLower), Is.False);
             Assert.That(argsLower, Is.Empty);
@@ -561,7 +613,8 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void ValidResult_IsNormalizedLowerCaseWithoutWhitespace()
         {
             string line = Win01.ServerCommandLine(Win01.Worker04Root, Win01.Endpoint, Win01.Token);
-            var detector = new ProcessDetector(new ScriptedRunner(Win01.Ok(line)));
+            ProcessDetector detector = Win01.DetectorFor(new ScriptedRunner(Win01.Ok(line)));
+            Win01.Prime(detector, Win01.ServerPid);
 
             Assert.That(detector.TryGetProcessCommandLine(Win01.ServerPid, out string argsLower), Is.True);
             Assert.That(argsLower, Is.EqualTo(detector.NormalizeForMatch(line)));
@@ -573,7 +626,9 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void TheRunnerIsGivenTheRequestedPid_AndNothingElse()
         {
             var runner = new ScriptedRunner(Win01.Ok("tool.exe"));
-            new ProcessDetector(runner).TryGetProcessCommandLine(Win01.ServerPid, out _);
+            ProcessDetector detector = Win01.DetectorFor(runner);
+            Win01.Prime(detector, Win01.ServerPid);
+            detector.TryGetProcessCommandLine(Win01.ServerPid, out _);
 
             Assert.That(runner.Calls, Is.EqualTo(1));
             Assert.That(runner.LastArguments, Is.EqualTo(WindowsProcessCommandLine.BuildArguments(Win01.ServerPid)));
@@ -592,11 +647,20 @@ namespace MCPForUnity.RouteIsolation.Tests
         private sealed class ScenarioInspector : IMcpProcessInspector
         {
             private readonly McpProcessInspector _commandLines;
+            private readonly ProcessDetector _detector;
 
             public ScenarioInspector(IWindowsCommandRunner runner)
             {
-                _commandLines = new McpProcessInspector(new ProcessDetector(runner));
+                // The lifetime the observer binds a result to is the scenario's own, read lazily so
+                // a test may change it after construction.
+                _detector = Win01.DetectorFor(
+                    runner,
+                    pid => pid == EditorPid ? EditorStart : (ServerExists ? ServerStart : (DateTime?)null));
+                _commandLines = new McpProcessInspector(_detector);
             }
+
+            /// <summary>Lets the background command-line query finish, as the awaiting lifecycle code does.</summary>
+            public void Prime() => Win01.Prime(_detector, Win01.ServerPid);
 
             public int EditorPid = Win01.EditorPid;
             public DateTime EditorStart = Win01.EditorStart;
@@ -657,7 +721,7 @@ namespace MCPForUnity.RouteIsolation.Tests
                 ServerPid = 0,
                 ServerStartUtc = null,
                 InstanceToken = token,
-                PidFilePath = McpRunStatePaths.GetPidFilePath(canonical, 8081),
+                PidFilePath = McpRunStatePaths.GetPidFilePath(canonical, Win01.Port),
                 LifecycleState = McpRunStateRecord.LifecycleStarting,
                 WrittenUtc = McpRunStateRecord.FormatUtc(Win01.RecordWritten),
             };
@@ -666,6 +730,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         private static McpOwnershipObservation Observe(
             ScenarioInspector inspector, ScenarioStore store, McpRunStateRecord record, string endpoint = Win01.Endpoint, string root = null)
         {
+            inspector.Prime();
             McpOwnershipObservation o = McpRouteObservationBuilder.Build(
                 store,
                 inspector,
@@ -711,16 +776,19 @@ namespace MCPForUnity.RouteIsolation.Tests
         }
 
         [Test]
-        public void TheNonceIsFoundInTheNormalizedCommandLineRegardlessOfCase()
+        public void TheNonceMustMatchExactly_NotCaseInsensitively()
         {
-            var inspector = new ScenarioInspector(RunnerFor(GoodCommandLine.ToUpperInvariant()));
+            // The server compares the nonce case-sensitively, and a managed launch emits a lower-case
+            // GUID, so an upper-cased line is a different token, not a spelling of the same one.
+            var inspector = new ScenarioInspector(RunnerFor(GoodCommandLine.Replace(Win01.Token, Win01.Token.ToUpperInvariant())));
             var store = new ScenarioStore();
             McpRunStateRecord pending = PendingRecord();
 
             Assert.That(
                 McpOwnershipEvaluator.TryIdentifyPendingServer(
-                    pending, Observe(inspector, store, pending), out _, out _),
-                Is.True);
+                    pending, Observe(inspector, store, pending), out _, out string detail),
+                Is.False);
+            Assert.That(detail, Does.Contain("nonce"));
         }
 
         // ---- original defect, now fail-closed on any query failure ---------------------
@@ -792,7 +860,7 @@ namespace MCPForUnity.RouteIsolation.Tests
         [Test]
         public void AProcessThatMerelyExists_WithNoNonceInItsCommandLine_IsNotOwned()
         {
-            var inspector = new ScenarioInspector(RunnerFor("python.exe -m http.server 8081"));
+            var inspector = new ScenarioInspector(RunnerFor("python.exe -m http.server 8181"));
             var store = new ScenarioStore();
             McpRunStateRecord pending = PendingRecord();
 
@@ -806,20 +874,20 @@ namespace MCPForUnity.RouteIsolation.Tests
         public void TheWrongPort_IsRefused()
         {
             var inspector = new ScenarioInspector(
-                RunnerFor(Win01.ServerCommandLine(Win01.Worker04Root, "http://127.0.0.1:8082", Win01.Token)));
+                RunnerFor(Win01.ServerCommandLine(Win01.Worker04Root, "http://127.0.0.1:8182", Win01.Token)));
             var store = new ScenarioStore();
             McpRunStateRecord pending = PendingRecord();
 
             // The editor observes a different endpoint than the one the record was written for.
             Assert.That(
                 McpOwnershipEvaluator.TryIdentifyPendingServer(
-                    pending, Observe(inspector, store, pending, endpoint: "http://127.0.0.1:8082"), out _, out _),
+                    pending, Observe(inspector, store, pending, endpoint: "http://127.0.0.1:8182"), out _, out _),
                 Is.False);
 
             McpRunStateRecord running = RunningRecord();
             Assert.That(
                 McpOwnershipEvaluator.EvaluateStop(
-                    running, Observe(inspector, store, running, endpoint: "http://127.0.0.1:8082")).Allowed,
+                    running, Observe(inspector, store, running, endpoint: "http://127.0.0.1:8182")).Allowed,
                 Is.False);
         }
 

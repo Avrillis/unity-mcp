@@ -55,6 +55,14 @@ namespace MCPForUnity.Editor.Services
         bool StopManagedLocalHttpServer();
 
         /// <summary>
+        /// Awaits the slow live evidence the ownership proof needs about this editor's managed server
+        /// (its command line), so a following <see cref="StopLocalHttpServer"/> finds it already
+        /// gathered. Never blocks a thread, never throws and never decides anything: a stop is still
+        /// refused unless every proof holds.
+        /// </summary>
+        System.Threading.Tasks.Task PrepareOwnershipEvidenceAsync(System.Threading.CancellationToken cancellationToken);
+
+        /// <summary>
         /// Best-effort detection: returns true if a local MCP HTTP server appears to be running
         /// on the configured local URL/port (used to drive UI state even if the session is not active).
         /// </summary>

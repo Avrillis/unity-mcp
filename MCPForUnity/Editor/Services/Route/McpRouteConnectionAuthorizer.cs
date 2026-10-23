@@ -1,3 +1,6 @@
+using System.Threading;
+using System.Threading.Tasks;
+
 namespace MCPForUnity.Editor.Services.Route
 {
     /// <summary>
@@ -5,10 +8,14 @@ namespace MCPForUnity.Editor.Services.Route
     /// <see cref="McpManagedPreConnectGate"/> to this editor process's resolved route and its full
     /// ownership evaluation.
     /// </summary>
-    public sealed class McpRouteConnectionAuthorizer : IMcpManagedConnectionAuthorizer
+    public sealed class McpRouteConnectionAuthorizer : IMcpManagedConnectionAuthorizer, IMcpManagedEvidencePreparer
     {
         /// <inheritdoc/>
         public bool IsManagedRoute => McpRouteProvider.Configuration.IsManagedRoute;
+
+        /// <inheritdoc/>
+        public Task PrepareAsync(CancellationToken token)
+            => McpRouteProvider.PrepareLaunchEvidenceAsync(token);
 
         /// <inheritdoc/>
         public bool TryGetLaunchToken(out string instanceToken, out string reason)

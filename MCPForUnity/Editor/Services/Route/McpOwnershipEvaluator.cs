@@ -123,7 +123,15 @@ namespace MCPForUnity.Editor.Services.Route
         public DateTime? ServerProcessStartUtc;
 
         public bool ServerCommandLineAvailable;
+
+        /// <summary>
+        /// The server's RAW command line (not lower-cased or whitespace-stripped), so its arguments
+        /// can be parsed and compared exactly. Null unless <see cref="ServerCommandLineAvailable"/>.
+        /// </summary>
         public string ServerCommandLine;
+
+        /// <summary>How <see cref="ServerCommandLine"/> must be split into arguments.</summary>
+        public McpCommandLineFormat ServerCommandLineFormat;
 
         /// <summary>
         /// Whether the editor process named by the record is still running. Used only to decide
@@ -294,14 +302,18 @@ namespace MCPForUnity.Editor.Services.Route
             {
                 return McpOwnershipDecision.Deny(
                     McpOwnershipDenyReason.NonceMismatch,
-                    "the server command line is unavailable, so the launch nonce cannot be echoed.");
+                    "the server command line is unavailable (or its verification has not completed), "
+                    + "so the launch nonce cannot be echoed.");
             }
 
-            if (observation.ServerCommandLine.IndexOf(record.InstanceToken, StringComparison.OrdinalIgnoreCase) < 0)
+            McpLaunchIdentityResult launch = VerifyLaunchIdentity(record, observation);
+            if (!launch.Verified)
             {
                 return McpOwnershipDecision.Deny(
-                    McpOwnershipDenyReason.NonceMismatch,
-                    "the live process does not carry the expected launch nonce.");
+                    DenyReasonFor(launch.Area),
+                    launch.Area == McpLaunchIdentityArea.Token
+                        ? $"the live process does not carry the expected launch nonce ({launch.Detail})"
+                        : $"the live process was not launched with the expected arguments ({launch.Detail})");
             }
 
             // ---- PID evidence -----------------------------------------------------
@@ -491,10 +503,19 @@ namespace MCPForUnity.Editor.Services.Route
             }
 
             if (!observation.ServerCommandLineAvailable
-                || string.IsNullOrEmpty(observation.ServerCommandLine)
-                || observation.ServerCommandLine.IndexOf(record.InstanceToken, StringComparison.OrdinalIgnoreCase) < 0)
+                || string.IsNullOrEmpty(observation.ServerCommandLine))
             {
-                detail = "the live process does not carry the pending record's launch nonce.";
+                detail = "the live process does not carry the pending record's launch nonce "
+                         + "(its command line is unavailable or its verification has not completed).";
+                return false;
+            }
+
+            McpLaunchIdentityResult launch = VerifyLaunchIdentity(record, observation);
+            if (!launch.Verified)
+            {
+                detail = launch.Area == McpLaunchIdentityArea.Token
+                    ? $"the live process does not carry the pending record's launch nonce ({launch.Detail})"
+                    : $"the live process was not launched with the pending record's arguments ({launch.Detail})";
                 return false;
             }
 
@@ -640,6 +661,42 @@ namespace MCPForUnity.Editor.Services.Route
             return observation.CurrentEditorStartUtc.HasValue
                    && McpRunStateRecord.TryParseUtc(record.EditorStartUtc, out DateTime recordedEditorStart)
                    && SameProcessInstant(recordedEditorStart, observation.CurrentEditorStartUtc.Value);
+        }
+
+        /// <summary>
+        /// Checks the server's RAW command line against the record: transport, endpoint, project
+        /// root, PID file and the launch nonce must each be present exactly once, as a whole argument,
+        /// with the recorded value. A nonce that merely appears somewhere in the line does not count.
+        /// </summary>
+        private static McpLaunchIdentityResult VerifyLaunchIdentity(
+            McpRunStateRecord record,
+            McpOwnershipObservation observation)
+        {
+            return McpLaunchArguments.Verify(
+                observation.ServerCommandLine,
+                observation.ServerCommandLineFormat,
+                new McpExpectedLaunch
+                {
+                    InstanceToken = record.InstanceToken,
+                    ProjectRoot = record.CanonicalProjectRoot,
+                    Endpoint = record.Endpoint,
+                    PidFilePath = record.PidFilePath,
+                });
+        }
+
+        private static McpOwnershipDenyReason DenyReasonFor(McpLaunchIdentityArea area)
+        {
+            switch (area)
+            {
+                case McpLaunchIdentityArea.Endpoint:
+                    return McpOwnershipDenyReason.ForeignEndpoint;
+                case McpLaunchIdentityArea.ProjectRoot:
+                    return McpOwnershipDenyReason.ForeignProject;
+                case McpLaunchIdentityArea.PidFile:
+                    return McpOwnershipDenyReason.PidFileMismatch;
+                default:
+                    return McpOwnershipDenyReason.NonceMismatch;
+            }
         }
 
         /// <summary>

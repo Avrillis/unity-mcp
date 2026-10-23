@@ -57,6 +57,17 @@ namespace MCPForUnity.Editor.Services.Route
     }
 
     /// <summary>
+    /// Optional companion of <see cref="IMcpManagedConnectionAuthorizer"/>: gathers slow live evidence
+    /// (such as a process command line) WITHOUT blocking, so the synchronous authorization that
+    /// follows finds a finished result instead of waiting for one. Failing to prepare never grants
+    /// anything; the authorization simply finds no evidence and refuses.
+    /// </summary>
+    public interface IMcpManagedEvidencePreparer
+    {
+        Task PrepareAsync(CancellationToken token);
+    }
+
+    /// <summary>
     /// Centralized managed pre-connect gate.
     ///
     /// Every managed connection path - normal startup, auto-start, manual Connect, reconnect and
@@ -65,6 +76,9 @@ namespace MCPForUnity.Editor.Services.Route
     /// </summary>
     public static class McpManagedPreConnectGate
     {
+        /// <summary>Upper bound for gathering the live evidence before one connection attempt.</summary>
+        public static readonly TimeSpan EvidenceBudget = TimeSpan.FromSeconds(10);
+
         /// <summary>Decides whether a connection may be attempted, without opening anything.</summary>
         public static McpPreConnectDecision Authorize(IMcpManagedConnectionAuthorizer authorizer)
         {
@@ -116,6 +130,25 @@ namespace MCPForUnity.Editor.Services.Route
             CancellationToken token)
         {
             var attempt = new McpConnectAttempt();
+
+            // Slow evidence is awaited here, off the Editor's thread, before the synchronous decision.
+            // No ConfigureAwait(false): the decision resumes in the caller's own context, exactly
+            // where it ran before this step existed.
+            if (authorizer != null && authorizer.IsManagedRoute && authorizer is IMcpManagedEvidencePreparer preparer)
+            {
+                using (CancellationTokenSource budget = CancellationTokenSource.CreateLinkedTokenSource(token))
+                {
+                    budget.CancelAfter(EvidenceBudget);
+                    try
+                    {
+                        await preparer.PrepareAsync(budget.Token);
+                    }
+                    catch (Exception)
+                    {
+                        // No evidence was gathered; the authorization below refuses.
+                    }
+                }
+            }
 
             McpPreConnectDecision decision = Authorize(authorizer);
             if (!decision.CanOpenConnection)

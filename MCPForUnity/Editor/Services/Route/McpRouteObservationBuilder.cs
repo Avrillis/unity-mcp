@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace MCPForUnity.Editor.Services.Route
 {
@@ -85,6 +86,24 @@ namespace MCPForUnity.Editor.Services.Route
                     observation.ServerCommandLineAvailable =
                         inspector.TryGetCommandLine(serverPid, out string commandLine);
                     observation.ServerCommandLine = observation.ServerCommandLineAvailable ? commandLine : null;
+                    observation.ServerCommandLineFormat = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                        ? McpCommandLineFormat.WindowsQuoted
+                        : McpCommandLineFormat.PosixFlat;
+
+                    // The command line may have been read at a different moment than the lifetime
+                    // above. Reading the creation instant again afterwards proves one process held
+                    // this PID throughout; if it changed, the line may belong to another process and
+                    // is withheld rather than combined with the earlier lifetime.
+                    if (observation.ServerCommandLineAvailable && observation.ServerProcessLifetimeAvailable)
+                    {
+                        if (!inspector.TryGetProcessStartTimeUtc(serverPid, out DateTime serverStartAfter)
+                            || !McpOwnershipEvaluator.SameProcessInstant(
+                                serverStartAfter, observation.ServerProcessStartUtc.Value))
+                        {
+                            observation.ServerCommandLineAvailable = false;
+                            observation.ServerCommandLine = null;
+                        }
+                    }
                 }
 
                 if (request.RecordedEditorPid > 0

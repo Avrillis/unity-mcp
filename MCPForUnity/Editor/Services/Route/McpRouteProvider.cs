@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using UnityEditor;
@@ -124,6 +126,47 @@ namespace MCPForUnity.Editor.Services.Route
         internal static void ResetForTests()
         {
             Cache.ResetForTests();
+        }
+
+        /// <summary>
+        /// Awaits the slow live evidence (the server's command line) that
+        /// <see cref="TryGetActiveLaunchToken(out string, out McpOwnershipDenyReason, out string)"/>
+        /// needs, so that call then finishes without waiting. Everything that touches Unity or the
+        /// ownership record is read synchronously first, in the caller's context; only the awaiting
+        /// itself is asynchronous. It authorizes nothing: it only gives the query time to finish.
+        /// </summary>
+        internal static async Task PrepareLaunchEvidenceAsync(CancellationToken token)
+        {
+            McpProcessInspector inspector;
+            int serverPid;
+            try
+            {
+                McpRouteConfiguration route = Configuration;
+                if (!route.IsValid || !route.IsManagedRoute)
+                {
+                    return;
+                }
+
+                McpOwnershipSnapshot snapshot = GetOrCreateDefaultStore().ReadOwnershipState();
+                if (!snapshot.IsPresent
+                    || !string.Equals(
+                        snapshot.Record.LifecycleState, McpRunStateRecord.LifecycleRunning, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                serverPid = snapshot.Record.ServerPid;
+                inspector = GetOrCreateProcessInspector();
+            }
+            catch
+            {
+                return;
+            }
+
+            if (serverPid > 0)
+            {
+                await inspector.PrefetchCommandLineAsync(serverPid, token);
+            }
         }
 
         /// <summary>

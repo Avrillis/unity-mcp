@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Services.Server;
 
 namespace MCPForUnity.Editor.Services.Route
@@ -207,17 +209,35 @@ namespace MCPForUnity.Editor.Services.Route
             commandLine = null;
             try
             {
-                if (!_processDetector.TryGetProcessCommandLine(pid, out string normalized) || string.IsNullOrEmpty(normalized))
+                // The RAW line: the ownership proof parses its arguments, which the lower-cased,
+                // whitespace-stripped form cannot support.
+                if (!_processDetector.TryGetRawProcessCommandLine(pid, out string raw) || string.IsNullOrEmpty(raw))
                 {
                     return false;
                 }
 
-                commandLine = normalized;
+                commandLine = raw;
                 return true;
             }
             catch
             {
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Awaits the background command-line query for one process so a following
+        /// <see cref="TryGetCommandLine"/> finds its result. Never blocks a thread and never throws.
+        /// </summary>
+        public async Task PrefetchCommandLineAsync(int pid, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _processDetector.PrefetchProcessCommandLineAsync(pid, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A failed prefetch leaves no evidence, which every caller already treats as a refusal.
             }
         }
 

@@ -156,6 +156,8 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         {
             public bool LooksLikeMcpServerProcess(int pid) => false;
             public bool TryGetProcessCommandLine(int pid, out string argsLower) { argsLower = string.Empty; return false; }
+            public bool TryGetRawProcessCommandLine(int pid, out string commandLine) { commandLine = null; return false; }
+            public System.Threading.Tasks.Task PrefetchProcessCommandLineAsync(int pid, System.Threading.CancellationToken cancellationToken) => System.Threading.Tasks.Task.CompletedTask;
             public System.Collections.Generic.List<int> GetListeningProcessIdsForPort(int port) => new System.Collections.Generic.List<int>();
             public int GetCurrentProcessId() => -1;
             public bool ProcessExists(int pid) => false;

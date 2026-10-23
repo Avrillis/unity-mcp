@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using UnityEngine;
 
@@ -13,16 +15,27 @@ namespace MCPForUnity.Editor.Services.Server
     /// </summary>
     public class ProcessDetector : IProcessDetector
     {
-        // Test seam for the Windows command-line query only. Null means the real, bounded runner.
-        private readonly IWindowsCommandRunner _windowsCommandRunner;
+        // Supplies Windows command lines without ever making a caller wait. Production shares one
+        // observer process-wide so every detector coalesces onto the same queries.
+        private readonly ProcessCommandLineObserver _commandLines;
 
-        public ProcessDetector() : this(null)
+        public ProcessDetector() : this((ProcessCommandLineObserver)null)
         {
         }
 
+        // Test seam: a scripted PowerShell launch. Everything else about the observer is real.
         internal ProcessDetector(IWindowsCommandRunner windowsCommandRunner)
+            : this(new ProcessCommandLineObserver(
+                ProcessCommandLineObserver.ReadProcessCreationUtc,
+                (pid, token) => WindowsProcessCommandLine.Query(
+                    pid, windowsCommandRunner, null, WindowsProcessCommandLine.DefaultTimeoutMs, token)))
         {
-            _windowsCommandRunner = windowsCommandRunner;
+        }
+
+        // Test seam: a fully controlled observer. Null means the shared production observer.
+        internal ProcessDetector(ProcessCommandLineObserver commandLines)
+        {
+            _commandLines = commandLines ?? ProcessCommandLineObserver.Shared;
         }
 
         /// <inheritdoc/>
@@ -75,21 +88,38 @@ namespace MCPForUnity.Editor.Services.Server
         public bool TryGetProcessCommandLine(int pid, out string argsLower)
         {
             argsLower = string.Empty;
+            if (!TryGetRawProcessCommandLine(pid, out string commandLine))
+            {
+                return false;
+            }
+
+            // Normalize for matching to tolerate ps wrapping/newlines.
+            argsLower = NormalizeForMatch(commandLine);
+            return !string.IsNullOrEmpty(argsLower);
+        }
+
+        /// <inheritdoc/>
+        public bool TryGetRawProcessCommandLine(int pid, out string commandLine)
+        {
+            commandLine = null;
             try
             {
                 if (Application.platform == RuntimePlatform.WindowsEditor)
                 {
-                    // Windows: read the exact command line through CIM (Win32_Process) using the fixed
-                    // system PowerShell. wmic.exe was removed from current Windows 11 releases, and
-                    // without a command line the managed ownership proof can never succeed.
-                    // Anything other than one well-formed result is a failure (fail closed).
-                    if (!WindowsProcessCommandLine.TryGetCommandLine(pid, _windowsCommandRunner, out string commandLine))
+                    // Windows: the exact command line comes from CIM (Win32_Process) through the fixed
+                    // system PowerShell, because wmic.exe was removed from current Windows 11 releases
+                    // and without a command line the managed ownership proof can never succeed. That
+                    // query takes hundreds of milliseconds, so it runs in the background and this call
+                    // only reports a finished, verified result for this exact process lifetime.
+                    // Pending, failed, cancelled or untrusted all mean "no evidence" (fail closed).
+                    CommandLineObservation observation = _commandLines.Observe(pid);
+                    if (!observation.IsReady)
                     {
                         return false;
                     }
 
-                    argsLower = NormalizeForMatch(commandLine);
-                    return !string.IsNullOrEmpty(argsLower);
+                    commandLine = observation.CommandLine;
+                    return true;
                 }
 
                 // Unix: ps -p pid -ww -o args=
@@ -101,15 +131,31 @@ namespace MCPForUnity.Editor.Services.Server
                 {
                     return false;
                 }
-                string combined = ((stdout ?? string.Empty) + "\n" + (stderr ?? string.Empty)).Trim();
-                if (string.IsNullOrEmpty(combined)) return false;
-                // Normalize for matching to tolerate ps wrapping/newlines.
-                argsLower = NormalizeForMatch(combined);
+
+                string raw = (stdout ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(raw)) return false;
+                commandLine = raw;
                 return true;
             }
             catch
             {
+                commandLine = null;
                 return false;
+            }
+        }
+
+        /// <inheritdoc/>
+        public Task PrefetchProcessCommandLineAsync(int pid, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return Application.platform == RuntimePlatform.WindowsEditor
+                    ? _commandLines.ObserveAsync(pid, cancellationToken)
+                    : Task.CompletedTask;
+            }
+            catch
+            {
+                return Task.CompletedTask;
             }
         }
 
@@ -203,8 +249,9 @@ namespace MCPForUnity.Editor.Services.Server
                         return false;
                     }
 
-                    // Step 2: Try to get the command line (CIM, no wmic) for better validation
-                    bool haveCommandLine = WindowsProcessCommandLine.TryGetCommandLine(pid, _windowsCommandRunner, out string rawCommandLine);
+                    // Step 2: Use the command line (CIM, no wmic) for better validation when a finished
+                    // background query already has it; this never waits for one.
+                    bool haveCommandLine = TryGetRawProcessCommandLine(pid, out string rawCommandLine);
                     string cmdLower = haveCommandLine ? rawCommandLine.ToLowerInvariant() : string.Empty;
                     string cmdCompact = haveCommandLine ? NormalizeForMatch(rawCommandLine) : string.Empty;
 

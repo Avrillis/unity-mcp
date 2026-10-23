@@ -107,6 +107,33 @@ against `UnityApiShims.cs`, a few lines of test-only stand-ins for `Application`
 `McpLog` and `ExecPath`, so nothing in the shipped package changes for testing.
 
 Cross-target dispatch refusal is a server-side behaviour (`Server/tests/test_route_guard.py`).
+
+### MCP-WIN-01 R2 corrections (independent review R1 findings)
+
+The first CIM implementation was reviewed and sent back. R2 changes the following; each row names the
+tests that pin it.
+
+| R1 finding | Correction | Tests |
+| --- | --- | --- |
+| **BLOCKER** synchronous CIM on Editor callbacks | `ProcessCommandLineObserver` runs the query off the calling thread. `Observe` never waits: it returns `Ready` only for a finished, verified query of that exact process lifetime (PID + creation instant), otherwise `Pending`/`Failed`, which every ownership decision already treats as "no evidence". One query per lifetime is shared by all callers, one query child runs at a time, at most three lifetimes are outstanding, failures cool down, every entry has a deadline, and `Reset` cancels and invalidates everything in flight. The pre-connect gate, the Stop button and the Editor-quit path use it. | `McpWin01ObserverTests.cs`, `McpWin01PerformanceTests.cs` |
+| **MAJOR** PowerShell module substitution | The child's `PSModulePath` is replaced with the system modules, `CimCmdlets` is imported by absolute path with `Microsoft.PowerShell.Core\Import-Module`, its name, GUID and base directory are checked, the cmdlet's assembly must live under the Windows directory, and the verified `CmdletInfo` object is invoked (not a name). Anything else prints `UNTRUSTED:*`. | `McpWin01TrustTests.cs` |
+| **MAJOR** valid output followed by a reader failure | A result counts only after the whole run succeeded: confirmed exit 0, both pipes read to the end without error, no timeout/cancel/truncation, no unexpected stderr (only empty or PowerShell CLIXML progress), and one `OK:<byte count>:<Base64>` line whose decoded length matches. One total deadline; every path stops and confirms the child. | `McpWin01ReaderTests.cs` |
+| **MAJOR** nonce substring | `McpLaunchArguments` parses the raw command line (C runtime rules on Windows) and requires `--transport http`, `--http-url`, `--unity-project-root`, `--pidfile` and `--unity-instance-token` each exactly once, as whole arguments equal to the record's values. The lower-cased, whitespace-stripped form can no longer satisfy the proof. | `McpLaunchArgumentsTests.cs` |
+| MINOR fixtures / whitespace | Synthetic user, project and cache names; no trailing whitespace in the new `.meta`. | `git diff --check` |
+
+How to run the process-spawning tests safely: every child they start is started by the test itself and
+stopped only through the `Process` handle it received from `Process.Start`. Nothing looks a process up by
+PID, and nothing outside the test run is touched.
+
+```bash
+dotnet test tools/route-isolation-tests/MCPForUnity.RouteIsolation.Tests.csproj
+# measurements (written to the test output and, when set, appended to the named file)
+MCP_WIN01_PERF_OUT=perf.txt dotnet test tools/route-isolation-tests/MCPForUnity.RouteIsolation.Tests.csproj --filter Category=Performance
+```
+
+These tests exercise the real observer, detector, inspector, builder, evaluator and gate against a scripted
+operating system. They are not a Unity Editor run: thread affinity, domain reload and frame timing inside
+a live Editor are not covered.
 ## Why the sources are compiled, not referenced
 
 The Route sources deliberately contain no `UnityEngine`/`UnityEditor` references. That keeps

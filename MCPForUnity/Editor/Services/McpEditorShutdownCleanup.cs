@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Server;
 using MCPForUnity.Editor.Services.Transport;
 using UnityEditor;
 using UnityEngine;
@@ -27,6 +28,15 @@ namespace MCPForUnity.Editor.Services
             // Guard against duplicate subscriptions across domain reloads.
             try { EditorApplication.quitting -= OnEditorQuitting; } catch { }
             EditorApplication.quitting += OnEditorQuitting;
+
+            // A command-line query child must not outlive the domain that asked for it.
+            try { AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload; } catch { }
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+        }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            try { ProcessCommandLineObserver.ResetSharedIfCreated(); } catch { }
         }
 
         // A -batchmode/CI instance resolves the interactive editor's server via the global
@@ -72,6 +82,11 @@ namespace MCPForUnity.Editor.Services
             {
                 McpLog.Warn($"Shutdown cleanup: failed to stop local HTTP server: {ex.Message}");
             }
+
+            // Stopping needs a finished, verified command-line observation and never waits for one:
+            // a server whose ownership could not be verified in time is left running rather than
+            // guessed at. Whatever query is still in flight ends with the editor.
+            try { ProcessCommandLineObserver.ResetSharedIfCreated(); } catch { }
         }
     }
 }
